@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/opensense-proto",
+    "crates/opensense-hw",
+    "crates/opensense-sys",
+    "apps/opensense",
+    "apps/opensense-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+# `u64::is_multiple_of` (1.87) and `slice::as_chunks` (1.88).
+rust-version = "1.88"
+authors = ["Hamza Güleşci"]
+repository = "https://github.com/hamzagulesci/OpenSense"
+
+[workspace.dependencies]
+opensense-proto = { path = "crates/opensense-proto" }
+opensense-hw = { path = "crates/opensense-hw" }
+opensense-sys = { path = "crates/opensense-sys" }
+
+thiserror = "1"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+opt-level = 3

@@ -1,0 +1,28 @@
+[package]
+name = "opensense"
+description = "Open-source control center for Acer Nitro laptops"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+opensense-proto.workspace = true
+opensense-hw.workspace = true
+opensense-sys.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
+egui_plot = "0.29"
+tray-icon = "0.19"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security", "Win32_Globalization", "Win32_UI_WindowsAndMessaging", "Win32_System_ProcessStatus"] }
+
+[build-dependencies]
+winresource = "0.1"

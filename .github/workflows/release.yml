@@ -1,0 +1,29 @@
+name: Release
+
+# Push a tag such as v0.1.0 to build the executables and publish a release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --workspace
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/release/opensense.exe, target/release/opensense-cli.exe, LICENSE, README.md dist/
+          Compress-Archive -Path dist/* -DestinationPath "OpenSense-${{ github.ref_name }}-windows-x64.zip"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: OpenSense-${{ github.ref_name }}-windows-x64.zip
+          generate_release_notes: true

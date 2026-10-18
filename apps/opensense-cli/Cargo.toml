@@ -1,0 +1,21 @@
+[package]
+name = "opensense-cli"
+description = "Command-line control for Acer Nitro laptops (fans, modes, lighting)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "opensense-cli"
+path = "src/main.rs"
+
+[dependencies]
+opensense-proto.workspace = true
+opensense-hw.workspace = true
+opensense-sys.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing-subscriber.workspace = true

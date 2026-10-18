@@ -1,0 +1,28 @@
+[package]
+name = "opensense-hw"
+description = "Hardware access for OpenSense: ACPI-WMI over COM and a demo transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+opensense-proto.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Rpc",
+    "Win32_System_Variant",
+    "Win32_System_Wmi",
+] }
+windows-core = "0.58"
