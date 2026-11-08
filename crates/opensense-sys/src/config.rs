@@ -94,6 +94,44 @@ impl Default for LightingConfig {
     }
 }
 
+/// Settings of one performance mode: a built-in one ("quiet", "default",
+/// "extreme") or a user mode ("custom1", ...) based on one of them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModeProfile {
+    /// Display name of a user mode (empty for built-in modes).
+    pub name: String,
+    /// Firmware mode the profile runs on: quiet, default or extreme.
+    pub base: String,
+    /// Fan curves: 8 points of (°C, %), empty = default curve.
+    pub cpu_curve: Vec<[u8; 2]>,
+    pub gpu_curve: Vec<[u8; 2]>,
+    /// Drive the fans from the curves (software loop in the tray agent).
+    pub apply_curve: bool,
+    /// Windows power mode key (efficiency/balanced/performance/high);
+    /// `None` = the default for the base mode.
+    pub power_mode: Option<String>,
+    /// Processor boost mode index (0..=6); `None` = leave Windows alone.
+    pub cpu_boost: Option<u8>,
+    /// NVIDIA core clock limit in MHz; `None` = no limit.
+    pub gpu_clock_limit: Option<u32>,
+}
+
+impl Default for ModeProfile {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            base: "default".into(),
+            cpu_curve: Vec::new(),
+            gpu_curve: Vec::new(),
+            apply_curve: false,
+            power_mode: None,
+            cpu_boost: None,
+            gpu_clock_limit: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -105,8 +143,11 @@ pub struct AppConfig {
     pub apply_on_start: bool,
     /// Operation mode name (quiet/default/extreme), `None` = leave as is.
     pub operation_mode: Option<String>,
-    /// 80 % battery charge limit, `None` = leave as is.
+    /// Older on/off form of the charge limit (80 % or none); read only to
+    /// migrate to `charge_target`.
     pub charge_limit: Option<bool>,
+    /// Charge target in percent (80..=100), `None` = leave as is.
+    pub charge_target: Option<u8>,
     pub fan: FanConfig,
     pub lighting: LightingConfig,
     pub temp_unit: TempUnit,
@@ -116,6 +157,63 @@ pub struct AppConfig {
     pub history_len: usize,
     /// Keep the tray agent running after the window closes.
     pub close_to_tray: bool,
+    /// Main window theme: "windows" (follow the Windows app theme), "dark"
+    /// or "light".
+    pub ui_mode: String,
+    /// Fan readings as RPM (false = percent of the highest speed seen).
+    pub fan_rpm: bool,
+    /// Battery charge shown in Wh instead of percent.
+    pub charge_watt: bool,
+    /// One-time charge to 100 % is active (cleared at full charge).
+    pub charge_full: bool,
+    /// Keep the main window above other windows.
+    pub topmost: bool,
+    /// Monochrome tray icon.
+    pub bw_icon: bool,
+    /// Current performance mode key; `None` = follow `operation_mode`.
+    pub current_mode: Option<String>,
+    /// Per-mode settings, keyed by mode key.
+    pub profiles: std::collections::BTreeMap<String, ModeProfile>,
+    /// Keep fan-curve points in their 10 °C columns.
+    pub fan_clamp: bool,
+    /// Highest CPU / GPU fan speed measured by "Calibrate".
+    pub fan_max_rpm: Option<[u16; 2]>,
+    /// Global keyboard shortcuts (Ctrl+Shift+F5 etc.).
+    pub hotkeys: bool,
+    /// Keyboard backlight off after this many idle seconds (0 = never),
+    /// plugged in / on battery.
+    pub kb_timeout_ac: u32,
+    pub kb_timeout_battery: u32,
+    /// Disable PCIe link power saving while plugged in.
+    pub aspm_off: bool,
+    /// Disable networking during Modern Standby.
+    pub standby_network_off: bool,
+    /// Keep the laptop awake with the lid closed when plugged in and an
+    /// external display is connected.
+    pub clamshell: bool,
+    /// Lid action to restore when clamshell mode ends.
+    pub clamshell_default_lid: Option<u32>,
+    /// No on-screen notification when a shortcut changes something.
+    pub disable_osd: bool,
+    /// Mode last used on AC power / on battery (restored when the power
+    /// source changes).
+    pub mode_ac: Option<String>,
+    pub mode_dc: Option<String>,
+    /// Unix time of the last update check and the version it found.
+    pub update_checked: Option<u64>,
+    pub latest_version: Option<String>,
+    /// Never check GitHub for updates.
+    pub skip_updates: bool,
+    /// In-game metrics overlay on, and only shown over games.
+    pub overlay: bool,
+    pub overlay_game_only: bool,
+    /// Overlay layout: 0 Light, 1 Default, 2 Full.
+    pub overlay_mode: u8,
+    /// Overlay position (screen pixels), size in percent and background
+    /// opacity (0..=255).
+    pub overlay_pos: Option<[i32; 2]>,
+    pub overlay_scale: u16,
+    pub overlay_alpha: u8,
 }
 
 impl Default for AppConfig {
@@ -126,12 +224,42 @@ impl Default for AppConfig {
             apply_on_start: true,
             operation_mode: None,
             charge_limit: None,
+            charge_target: None,
             fan: FanConfig::default(),
             lighting: LightingConfig::default(),
             temp_unit: TempUnit::Celsius,
             poll_ms: 1000,
             history_len: 720,
             close_to_tray: true,
+            ui_mode: "windows".into(),
+            fan_rpm: true,
+            charge_watt: false,
+            charge_full: false,
+            topmost: false,
+            bw_icon: false,
+            current_mode: None,
+            profiles: Default::default(),
+            fan_clamp: true,
+            fan_max_rpm: None,
+            hotkeys: true,
+            kb_timeout_ac: 0,
+            kb_timeout_battery: 60,
+            aspm_off: false,
+            standby_network_off: false,
+            clamshell: false,
+            clamshell_default_lid: None,
+            disable_osd: false,
+            mode_ac: None,
+            mode_dc: None,
+            update_checked: None,
+            latest_version: None,
+            skip_updates: false,
+            overlay: false,
+            overlay_game_only: false,
+            overlay_mode: 1,
+            overlay_pos: None,
+            overlay_scale: 100,
+            overlay_alpha: 128,
         }
     }
 }
@@ -154,6 +282,16 @@ impl AppConfig {
             }),
             Err(_) => Self::default(),
         }
+    }
+
+    /// Charge target, falling back to the older on/off setting.
+    pub fn charge_target(&self) -> Option<u8> {
+        self.charge_target.map(|t| t.clamp(80, 100)).or(self.charge_limit.map(|on| if on { 80 } else { 100 }))
+    }
+
+    pub fn set_charge_target(&mut self, target: u8) {
+        self.charge_target = Some(target.clamp(80, 100));
+        self.charge_limit = None;
     }
 
     pub fn save(&self) -> Result<(), SysError> {

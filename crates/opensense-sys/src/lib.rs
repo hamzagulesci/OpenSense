@@ -2,6 +2,7 @@
 //! going through the firmware interface.
 
 pub mod autostart;
+pub mod battery;
 pub mod config;
 pub mod cpu;
 #[cfg(windows)]
@@ -10,6 +11,7 @@ pub mod gpu_name;
 pub mod oem;
 pub mod power;
 pub mod privilege;
+pub mod tweaks;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SysError {

@@ -73,7 +73,29 @@ fn task_xml(exe: &str, user: &str) -> String {
     )
 }
 
+/// Whether the task exists. Reads Task Scheduler's registry cache, which is
+/// instant; falls back to `schtasks /Query` (~100 ms, one process) when the
+/// cache cannot be read.
 pub fn is_enabled() -> bool {
+    #[cfg(windows)]
+    {
+        use windows::core::HSTRING;
+        use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+        use windows::Win32::System::Registry::{RegCloseKey, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ};
+        let path =
+            HSTRING::from(format!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\{TASK_NAME}"));
+        let mut key = HKEY::default();
+        let r = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, &path, 0, KEY_READ, &mut key) };
+        if r.is_ok() {
+            unsafe {
+                let _ = RegCloseKey(key);
+            }
+            return true;
+        }
+        if r == ERROR_FILE_NOT_FOUND {
+            return false;
+        }
+    }
     schtasks(&["/Query", "/TN", TASK_NAME]).map(|o| o.status.success()).unwrap_or(false)
 }
 

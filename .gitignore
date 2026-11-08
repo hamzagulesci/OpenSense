@@ -1,2 +1,36 @@
+# Rust build output
 /target
 *.pdb
+**/*.rs.bk
+
+# Installer and release output
+/dist/
+/zip/
+/installer/opensense.ico
+/installer/Output/
+*.zip
+
+# Third-party reference sources, not part of OpenSense
+/g-helper-main/
+/g-helper-0.291/
+
+# Logs and local test files
+*.log
+*.etl
+opensense-battery-report.html
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*~
+
+# Operating system files
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Local tool state
+.claude/
+graphify-out/

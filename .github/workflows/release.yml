@@ -1,6 +1,7 @@
 name: Release
 
-# Push a tag such as v0.1.0 to build the executables and publish a release.
+# Push a tag such as v0.2.0 to build the executables and the installer and
+# publish a release.
 on:
   push:
     tags: ["v*"]
@@ -17,13 +18,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --release --workspace
-      - name: Package
+      - name: Package zip
         shell: pwsh
         run: |
           New-Item -ItemType Directory dist | Out-Null
-          Copy-Item target/release/opensense.exe, target/release/opensense-cli.exe, LICENSE, README.md dist/
-          Compress-Archive -Path dist/* -DestinationPath "OpenSense-${{ github.ref_name }}-windows-x64.zip"
+          New-Item -ItemType Directory zip | Out-Null
+          Copy-Item target/release/opensense.exe, target/release/opensense-cli.exe, LICENSE, README.md zip/
+          Compress-Archive -Path zip/* -DestinationPath "dist/OpenSense-${{ github.ref_name }}-windows-x64.zip"
+      - name: Build installer
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue) -and -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+          $ico = Get-ChildItem target/release/build -Recurse -Filter opensense.ico | Select-Object -First 1
+          if ($ico) { Copy-Item $ico.FullName installer/opensense.ico }
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" installer/opensense.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: softprops/action-gh-release@v2
         with:
-          files: OpenSense-${{ github.ref_name }}-windows-x64.zip
+          files: |
+            dist/OpenSense-${{ github.ref_name }}-setup.exe
+            dist/OpenSense-${{ github.ref_name }}-windows-x64.zip
           generate_release_notes: true

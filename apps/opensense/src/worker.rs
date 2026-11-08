@@ -21,26 +21,17 @@ pub enum Command {
     FansAuto,
     FansMax,
     FansCustom(CustomFan),
-    CoolBoost(bool),
     Mode(OperationMode),
     StaticLighting(StaticLighting),
     DynamicLighting(DynamicLighting),
     GpuMode(GpuMode),
-    Overdrive(bool),
-    KbTimeout(BacklightTimeout),
     ChargeLimit(bool),
-    SetPollInterval(Duration),
-    RefreshState,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Sample {
-    /// Seconds since the worker started.
-    pub t: f64,
     pub cpu_temp: Option<f32>,
     pub gpu_temp: Option<f32>,
-    pub cpu_fan: Option<f32>,
-    pub gpu_fan: Option<f32>,
 }
 
 /// Everything the UI renders. Cheap to clone the scalar part; history is
@@ -68,6 +59,8 @@ pub struct Snapshot {
     pub overdrive: Option<bool>,
     pub kb_timeout: Option<BacklightTimeout>,
     pub battery: Option<opensense_proto::battery::BatteryHealth>,
+    /// Rate, capacities and wear from the battery driver.
+    pub battery_info: Option<opensense_sys::battery::BatteryInfo>,
     pub history: VecDeque<Sample>,
     pub cpu_temp_minmax: Option<(f32, f32)>,
     pub gpu_temp_minmax: Option<(f32, f32)>,
@@ -117,7 +110,6 @@ struct Worker {
     cpu: Option<CpuMonitor>,
     #[cfg(windows)]
     gpu_load: Option<opensense_sys::gpu_load::GpuLoadMonitor>,
-    started: Instant,
     tick: u64,
     /// For reconnecting after repeated read failures.
     kind: TransportKind,
@@ -160,7 +152,6 @@ impl Worker {
             cpu,
             #[cfg(windows)]
             gpu_load: if monitors { opensense_sys::gpu_load::GpuLoadMonitor::new().ok() } else { None },
-            started: Instant::now(),
             tick: 0,
             kind,
             profile,
@@ -170,17 +161,13 @@ impl Worker {
 
     fn run(mut self, rx: Receiver<Command>, poll: Duration) {
         // A hand-edited poll_ms of 0 must not turn into a busy loop.
-        let mut poll = poll.max(Duration::from_millis(250));
+        let poll = poll.max(Duration::from_millis(250));
         self.refresh_state();
         self.poll();
         let mut next = Instant::now() + poll;
         loop {
             let timeout = next.saturating_duration_since(Instant::now());
             match rx.recv_timeout(timeout) {
-                Ok(Command::SetPollInterval(d)) => {
-                    poll = d.max(Duration::from_millis(250));
-                    next = Instant::now() + poll;
-                }
                 Ok(cmd) => {
                     self.execute(cmd);
                     (self.repaint)();
@@ -204,33 +191,17 @@ impl Worker {
             Command::FansAuto => ("Fans: Auto", dev.set_fans_auto()),
             Command::FansMax => ("Fans: Max", dev.set_fans_max()),
             Command::FansCustom(c) => ("Fans: Custom", dev.set_fans_custom(*c)),
-            Command::CoolBoost(on) => ("CoolBoost updated", dev.set_coolboost(*on)),
             Command::Mode(m) => ("Operation mode changed", dev.set_operation_mode(*m)),
             Command::StaticLighting(l) => ("Keyboard colours applied", dev.apply_static_lighting(l)),
             Command::DynamicLighting(d) => ("Lighting effect applied", dev.apply_dynamic_lighting(d)),
-            Command::GpuMode(m) => ("GPU mode set, reboot to apply", dev.set_gpu_mode(*m)),
-            Command::Overdrive(on) => ("LCD overdrive updated", dev.set_lcd_overdrive(*on)),
-            Command::KbTimeout(t) => ("Keyboard timeout updated", dev.set_backlight_timeout(*t)),
+            Command::GpuMode(m) => (crate::apply::GPU_SET_LABEL, dev.set_gpu_mode(*m)),
             Command::ChargeLimit(on) => ("Battery charge limit updated", dev.set_charge_limit(*on)),
-            Command::RefreshState => {
-                self.refresh_state();
-                return;
-            }
-            Command::SetPollInterval(_) => return,
         };
         if let Err(e) = &res {
             tracing::warn!("{label}: {e}");
         }
         self.shared.lock().last_action = Some((label, res.as_ref().err().map(|e| e.to_string())));
-        if matches!(
-            cmd,
-            Command::Mode(_)
-                | Command::CoolBoost(_)
-                | Command::GpuMode(_)
-                | Command::Overdrive(_)
-                | Command::KbTimeout(_)
-                | Command::ChargeLimit(_)
-        ) {
+        if matches!(cmd, Command::Mode(_) | Command::GpuMode(_) | Command::ChargeLimit(_)) {
             self.refresh_state();
         }
     }
@@ -296,6 +267,7 @@ impl Worker {
         #[cfg(not(windows))]
         let gpu_load: Option<f32> = None;
         let power = opensense_sys::power::status().unwrap_or_default();
+        let battery_info = opensense_sys::battery::info().ok();
         if self.tick.is_multiple_of(30) {
             self.refresh_state();
         }
@@ -308,16 +280,11 @@ impl Worker {
         s.cpu = cpu;
         s.gpu_usage = gpu_load;
         s.power = power;
+        s.battery_info = battery_info;
 
         let r = s.readings;
         let gpu_temp = r.gpu_temp.map(f32::from);
-        let sample = Sample {
-            t: self.started.elapsed().as_secs_f64(),
-            cpu_temp: r.cpu_temp.map(f32::from),
-            gpu_temp,
-            cpu_fan: r.cpu_fan_rpm.map(f32::from),
-            gpu_fan: r.gpu_fan_rpm.map(f32::from),
-        };
+        let sample = Sample { cpu_temp: r.cpu_temp.map(f32::from), gpu_temp };
         let mm = |cur: Option<(f32, f32)>, v: Option<f32>| match (cur, v) {
             (Some((lo, hi)), Some(v)) => Some((lo.min(v), hi.max(v))),
             (None, Some(v)) => Some((v, v)),

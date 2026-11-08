@@ -32,32 +32,40 @@ built to use as few resources as possible.
 
 | Area | What you can do |
 |---|---|
-| **Fans** | Silent, Auto, Max and Custom modes; quick presets; one slider for both fans or one per fan |
-| **Operation modes** | Quiet, Default and Extreme |
-| **Keyboard lighting** | 4-zone RGB, colour themes, effects (Breathing, Neon, Wave, Shifting, Zoom), live keyboard preview, backlight auto-off |
-| **Battery** | Limit charging to 80% to extend battery life |
-| **Monitoring** | CPU and GPU temperature, usage and fan speed; CPU clock; 3-minute history charts |
-| **Hardware** | GPU MUX switch (hybrid / discrete only) and LCD overdrive, on models that support them |
-| **Power** | Switch Windows power plans |
-| **App** | Dark, OLED black and light themes; English and Turkish; system tray menu; start with Windows |
+| **Main window** | Compact window by the clock, like G-Helper: Mode, GPU Mode, Laptop Keyboard and Battery sections, live CPU/GPU temperatures and fan speeds |
+| **Performance modes** | Quiet, Default and Extreme plus your own modes based on them; each mode has its own fan curves, Windows power mode and CPU boost |
+| **Fans + Power** | Drag-to-edit CPU and GPU fan curves (temperature to fan speed), Windows power mode, CPU boost, NVIDIA clock limit, fan calibration |
+| **GPU mode** | Standard (hybrid) / Ultimate (discrete only) MUX switch with a restart prompt |
+| **Keyboard lighting** | 4-zone RGB: static colours and effects (Breathing, Neon, Wave, Shifting, Zoom), speed, direction, brightness, idle timeout plugged / on battery |
+| **Battery** | Charge limit 80–100%, one-time charge to 100%, charge / discharge watts, battery health, Windows battery report |
+| **Shortcuts** | Ctrl+Shift+F5 next mode, Ctrl+Shift+F12 show/hide, Ctrl+Shift+Alt+1/2/3 Quiet/Default/Extreme, Shift+Volume backlight, Ctrl+Shift+Alt+O overlay; on-screen notification |
+| **Overlay** | In-game FPS, temperatures, fan speeds, load and memory, optionally only over games |
+| **Automation** | Mode remembered per power source (plugged / battery), clamshell mode, PCIe link power and Modern Standby network tweaks, hibernate timeout, vendor service control |
+| **App** | Follows the Windows theme (or dark / light); English and Turkish; tray menu; start with Windows; update check |
 | **CLI** | `opensense-cli` for scripting and automation |
 
 OpenSense asks the firmware which features your laptop supports and only shows those.
 
 ### Download and install
 
-1. Download the latest `OpenSense-…-windows-x64.zip` from
-   [Releases](https://github.com/hamzagulesci/OpenSense/releases).
+**Installer (recommended):** download `OpenSense-…-setup.exe` from
+[Releases](https://github.com/hamzagulesci/OpenSense/releases) and run it. It installs to
+`Program Files`, adds a Start menu shortcut and can start OpenSense with Windows. Uninstall it
+from *Settings → Apps*.
+
+**Portable:**
+
+1. Download `OpenSense-…-windows-x64.zip` from the same page.
 2. Extract it to a permanent folder, for example `C:\Program Files\OpenSense`.
 3. Run `opensense.exe`. If it is not running as administrator, it offers to restart with the
    rights the firmware interface requires.
-4. Optional: turn on **Settings → Start with Windows**. This starts the small tray process at
+4. Optional: turn on **Run on Startup** in the main window. This starts the small tray process at
    sign-in without a UAC prompt.
 
 **Requirements:** Windows 10 or 11 (64-bit) and an Acer Nitro laptop.
 
-**Uninstall:** turn off *Start with Windows*, choose *Quit* in the tray menu, then delete the folder.
-Settings are stored in `%APPDATA%\OpenSense`.
+**Uninstall (portable):** turn off *Run on Startup*, choose *Quit* in the tray menu, then delete the
+folder. Settings are stored in `%APPDATA%\OpenSense`.
 
 ### Works without NitroSense
 
@@ -70,17 +78,24 @@ NitroSense and Acer Care Center can be uninstalled.
 
 | Process | When it runs | Memory | CPU |
 |---|---|---|---|
-| Tray process | Always, in the background | ~3 MB | ~0% |
-| Window | Only while open; fully exits when closed | ~42 MB in use, ~6–15 MB in the background | ~0.03% |
+| Tray process | Always, in the background | ~3 MB (overlay on: a few MB more) | ~0% |
+| Main window, Fans + Power, Extra, Updates | Only while open; each fully exits when closed | ~85 MB each while open | ~0% |
 
-The tray process has no graphics context. It applies your saved settings at startup, offers quick
-actions in its menu and shows temperatures in its tooltip.
+The tray process has no graphics context. It applies your saved settings at startup, runs the fan
+curves, shortcuts, battery and power automation, draws the overlay and on-screen notifications, and
+shows temperatures in its tooltip. Left-click the tray icon to open the main window next to the
+clock; click it again or press Esc to close it. Right-click for the menu (modes, GPU mode, overlay).
 
 ### FAQ
 
-**The fans don't stop in Custom mode at 0%.**
-The firmware keeps the fans at about 2,500 RPM or more in Custom mode. For the quietest laptop use
-**Silent** (lower CPU/GPU power) or **Auto** (the fans slow down further when the laptop is cool).
+**The fans don't stop at 0% on a fan curve.**
+The firmware keeps the fans at about 2,500 RPM or more whenever OpenSense sets their speed. For the
+quietest laptop turn **Apply Fan Curve** off in Fans + Power: in Quiet mode the firmware's own
+control slows the fans further when the laptop is cool.
+
+**Do the fan curves keep working when the window is closed?**
+Yes. The Acer firmware has no fan curves of its own, so the tray process applies them once a
+second; it must stay running (it does with *Start with Windows*).
 
 **Why does it need administrator rights?**
 Windows only lets administrators call the firmware interface. With *Start with Windows* enabled,
@@ -135,8 +150,8 @@ cargo run -p opensense -- --mock
 ```
 crates/opensense-proto   firmware method table and value layouts (with tests)
 crates/opensense-hw      WMI (COM) access, demo transport, high-level device API
-crates/opensense-sys     CPU/GPU monitoring, power plans, settings, autostart
-apps/opensense           desktop app and tray process (egui)
+crates/opensense-sys     CPU/GPU monitoring, battery, power and Windows tweaks, settings, autostart
+apps/opensense           main window and child windows (egui), tray process, overlay
 apps/opensense-cli       command-line tool
 ```
 
@@ -176,32 +191,40 @@ az kaynak kullanacak şekilde tasarlanmıştır.
 
 | Alan | Neler yapılabilir |
 |---|---|
-| **Fanlar** | Sessiz, Otomatik, Maksimum ve Özel modlar; hızlı ön ayarlar; iki fan için tek slider ya da fan başına ayrı slider |
-| **Çalışma modları** | Sessiz, Varsayılan ve Ekstrem |
-| **Klavye aydınlatması** | 4 bölgeli RGB, renk temaları, efektler (Nefes, Neon, Dalga, Kayan, Yakınlaşma), canlı klavye önizlemesi, ışığın otomatik kapanması |
-| **Pil** | Pil ömrünü uzatmak için şarjı %80 ile sınırlama |
-| **İzleme** | CPU ve GPU sıcaklığı, kullanımı ve fan devri; CPU saat hızı; son 3 dakikanın grafikleri |
-| **Donanım** | GPU MUX (hibrit / yalnız harici) ve LCD overdrive, destekleyen modellerde |
-| **Güç** | Windows güç planı değiştirme |
-| **Uygulama** | Karanlık, OLED siyah ve aydınlık tema; Türkçe ve İngilizce; sistem tepsisi menüsü; Windows ile başlatma |
+| **Ana pencere** | G-Helper gibi saatin yanında açılan kompakt pencere: Mod, GPU Modu, Klavye ve Pil bölümleri, canlı CPU/GPU sıcaklığı ve fan hızları |
+| **Performans modları** | Sessiz, Varsayılan ve Ekstrem ile bunlara dayalı kendi modlarınız; her modun kendi fan eğrileri, Windows güç modu ve CPU Boost ayarı |
+| **Fanlar + Güç** | Sürükleyerek düzenlenen CPU ve GPU fan eğrileri (sıcaklığa göre fan hızı), Windows güç modu, CPU Boost, NVIDIA saat sınırı, fan kalibrasyonu |
+| **GPU modu** | Standart (hibrit) / Ultimate (yalnız harici) MUX geçişi, yeniden başlatma sorusuyla |
+| **Klavye aydınlatması** | 4 bölgeli RGB: sabit renkler ve efektler (Nefes, Neon, Dalga, Kayan, Yakınlaşma), hız, yön, parlaklık, adaptörde / pilde boşta kapanma süresi |
+| **Pil** | %80–100 şarj sınırı, bir kerelik %100 şarj, şarj / deşarj gücü, pil sağlığı, Windows pil raporu |
+| **Kısayollar** | Ctrl+Shift+F5 sonraki mod, Ctrl+Shift+F12 göster/gizle, Ctrl+Shift+Alt+1/2/3 Sessiz/Varsayılan/Ekstrem, Shift+Ses klavye ışığı, Ctrl+Shift+Alt+O overlay; ekran bildirimi |
+| **Overlay** | Oyun içinde FPS, sıcaklıklar, fan hızları, yük ve bellek; istenirse yalnız oyunlarda |
+| **Otomasyon** | Güç kaynağına göre hatırlanan mod (adaptör / pil), kapak kapalı modu, PCIe ve Modern Bekleme ağ ayarları, hazırda bekletme süresi, Acer servis kontrolü |
+| **Uygulama** | Windows temasını izler (ya da koyu / açık); Türkçe ve İngilizce; tepsi menüsü; Windows ile başlatma; güncelleme kontrolü |
 | **Komut satırı** | Betik ve otomasyon için `opensense-cli` |
 
 OpenSense, dizüstünüzün hangi özellikleri desteklediğini firmware'e sorar ve yalnızca onları gösterir.
 
 ### İndirme ve kurulum
 
-1. [Releases](https://github.com/hamzagulesci/OpenSense/releases) sayfasından en güncel
-   `OpenSense-…-windows-x64.zip` dosyasını indirin.
+**Kurulum dosyası (önerilen):** [Releases](https://github.com/hamzagulesci/OpenSense/releases)
+sayfasından `OpenSense-…-setup.exe` dosyasını indirip çalıştırın. `Program Files`'a kurar, Başlat
+menüsüne kısayol ekler ve isterseniz OpenSense'i Windows ile başlatır. *Ayarlar → Uygulamalar*'dan
+kaldırılır.
+
+**Taşınabilir:**
+
+1. Aynı sayfadan `OpenSense-…-windows-x64.zip` dosyasını indirin.
 2. Kalıcı bir klasöre çıkarın, örneğin `C:\Program Files\OpenSense`.
 3. `opensense.exe`'yi çalıştırın. Yönetici olarak açılmadıysa, firmware arayüzünün gerektirdiği
    yetkiyle yeniden başlatmayı önerir.
-4. İsteğe bağlı: **Ayarlar → Windows ile başlat** seçeneğini açın. Bu, küçük tepsi sürecini oturum
-   açılınca UAC sormadan başlatır.
+4. İsteğe bağlı: ana penceredeki **Başlangıçta çalıştır** seçeneğini açın. Bu, küçük tepsi sürecini
+   oturum açılınca UAC sormadan başlatır.
 
 **Gereksinimler:** Windows 10 veya 11 (64 bit) ve bir Acer Nitro dizüstü.
 
-**Kaldırma:** *Windows ile başlat* seçeneğini kapatın, tepsi menüsünden *Çıkış*'ı seçin ve klasörü
-silin. Ayarlar `%APPDATA%\OpenSense` klasöründe saklanır.
+**Kaldırma (taşınabilir):** *Başlangıçta çalıştır*'ı kapatın, tepsi menüsünden *Çıkış*'ı seçin ve
+klasörü silin. Ayarlar `%APPDATA%\OpenSense` klasöründe saklanır.
 
 ### NitroSense olmadan çalışır
 
@@ -214,18 +237,24 @@ NitroSense ve Acer Care Center kaldırılabilir.
 
 | Süreç | Ne zaman çalışır | Bellek | CPU |
 |---|---|---|---|
-| Tepsi süreci | Her zaman, arka planda | ~3 MB | ~%0 |
-| Pencere | Yalnızca açıkken; kapatınca tamamen çıkar | Kullanımda ~42 MB, arka planda ~6–15 MB | ~%0,03 |
+| Tepsi süreci | Her zaman, arka planda | ~3 MB (overlay açıkken birkaç MB fazla) | ~%0 |
+| Ana pencere, Fanlar + Güç, Ekstra, Güncellemeler | Yalnızca açıkken; her biri kapatınca tamamen çıkar | açıkken her biri ~85 MB | ~%0 |
 
-Tepsi sürecinin grafik bağlamı yoktur. Açılışta kayıtlı ayarları uygular, menüsünde hızlı işlemler
-sunar ve ipucunda sıcaklıkları gösterir.
+Tepsi sürecinin grafik bağlamı yoktur. Açılışta kayıtlı ayarları uygular; fan eğrilerini,
+kısayolları, pil ve güç otomasyonunu çalıştırır; overlay'i ve ekran bildirimlerini çizer, ipucunda
+sıcaklıkları gösterir. Tepsi simgesine sol tıklayınca saatin yanında ana pencere açılır; kapatmak için
+tekrar tıklayın ya da Esc'ye basın. Sağ tık menüsünde modlar, GPU modu ve overlay bulunur.
 
 ### Sık sorulan sorular
 
-**Özel modda %0'da fanlar durmuyor.**
-Firmware, Özel modda fanları yaklaşık 2.500 RPM'in altına indirmez. En sessiz kullanım için
-**Sessiz** (işlemci ve ekran kartı gücü düşer) veya **Otomatik** (dizüstü serinken fanlar daha da
-yavaşlar) modunu seçin.
+**Fan eğrisinde %0'da fanlar durmuyor.**
+OpenSense fan hızını ayarladığında firmware fanları yaklaşık 2.500 RPM'in altına indirmez. En sessiz
+kullanım için Fanlar + Güç'te **Fan eğrisini uygula**'yı kapatın: Sessiz modda firmware'in kendi
+kontrolü, dizüstü serinken fanları daha da yavaşlatır.
+
+**Pencere kapalıyken fan eğrileri çalışmaya devam ediyor mu?**
+Evet. Acer firmware'inin kendi fan eğrisi yok; eğrileri tepsi süreci saniyede bir uygular, bu yüzden
+tepsi sürecinin açık kalması gerekir (*Windows ile başlat* açıksa kalır).
 
 **Neden yönetici yetkisi gerekiyor?**
 Windows, firmware arayüzünü yalnızca yöneticilerin kullanmasına izin verir. *Windows ile başlat*
@@ -280,8 +309,8 @@ cargo run -p opensense -- --mock
 ```
 crates/opensense-proto   firmware metot tablosu ve değer düzenleri (testlerle)
 crates/opensense-hw      WMI (COM) erişimi, demo taşıyıcısı, yüksek seviye cihaz API'si
-crates/opensense-sys     CPU/GPU izleme, güç planları, ayarlar, otomatik başlatma
-apps/opensense           masaüstü uygulaması ve tepsi süreci (egui)
+crates/opensense-sys     CPU/GPU izleme, pil, güç ve Windows ayarları, ayarlar, otomatik başlatma
+apps/opensense           ana pencere ve alt pencereler (egui), tepsi süreci, overlay
 apps/opensense-cli       komut satırı aracı
 ```
 

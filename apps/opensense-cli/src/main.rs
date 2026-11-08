@@ -245,6 +245,12 @@ fn main() -> Result<()> {
             if let Ok(p) = opensense_sys::power::status() {
                 println!("power                  ac={} battery={:?}%", p.on_ac, p.battery_percent);
             }
+            if let Ok(b) = opensense_sys::battery::info() {
+                let w = b.rate_watts().map(|w| format!("{w:+.1} W")).unwrap_or_else(|| "--".into());
+                let h = b.health_percent().map(|h| format!("{h:.1} %")).unwrap_or_else(|| "--".into());
+                let c = b.cycles.map(|c| c.to_string()).unwrap_or_else(|| "--".into());
+                println!("battery                rate {w}, health {h}, cycles {c}");
+            }
         }
         Cmd::Probe => probe(&dev),
         Cmd::Raw { op, method, value } => {
