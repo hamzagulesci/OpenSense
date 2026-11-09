@@ -72,6 +72,8 @@ Filename: "{app}\opensense.exe"; Parameters: "--autostart-off"; Flags: runhidden
 Filename: "{app}\opensense.exe"; Description: "{cm:LaunchNow}"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
+; A clean quit first: the agent restores the fans before it exits.
+Filename: "{app}\opensense.exe"; Parameters: "--quit"; Flags: runhidden waituntilterminated; RunOnceId: "QuitApp"
 Filename: "{app}\opensense.exe"; Parameters: "--autostart-off"; Flags: runhidden waituntilterminated; RunOnceId: "Autostart"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM opensense.exe"; Flags: runhidden waituntilterminated; RunOnceId: "StopApp"
 
@@ -80,11 +82,15 @@ Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM opensense.exe"; Flags: runhi
 Type: files; Name: "{app}\*.old"
 
 [Code]
-// Stop a running OpenSense (tray agent and windows) so its files can be replaced.
+// Stop a running OpenSense (tray agent and windows) so its files can be
+// replaced. A clean quit first lets the agent restore the fans; taskkill
+// only removes what is left (open windows, an older version).
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   Code: Integer;
 begin
+  if FileExists(ExpandConstant('{app}\opensense.exe')) then
+    Exec(ExpandConstant('{app}\opensense.exe'), '--quit', '', SW_HIDE, ewWaitUntilTerminated, Code);
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM opensense.exe', '', SW_HIDE, ewWaitUntilTerminated, Code);
   Sleep(500);
   Result := '';

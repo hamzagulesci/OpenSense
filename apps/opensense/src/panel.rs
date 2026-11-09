@@ -242,6 +242,8 @@ pub struct QuickPanel {
     focused: bool,
     /// Hides the window when another app takes the foreground.
     away: crate::tray::AwayWatch,
+    /// Last check whether the tray agent runs.
+    tray_checked: Option<(Instant, bool)>,
     height: f32,
     autostart: bool,
     fan_max_seen: f32,
@@ -286,6 +288,7 @@ impl QuickPanel {
             marked: false,
             focused: false,
             away: crate::tray::AwayWatch::default(),
+            tray_checked: None,
             height: INITIAL_HEIGHT,
             autostart: opensense_sys::autostart::is_enabled(),
             fan_max_seen: FAN_MAX_RPM,
@@ -406,7 +409,8 @@ impl QuickPanel {
         // window closes, Windows can make this window active in the
         // background while another app keeps the foreground.
         let busy = self.picker.is_some() || self.gpu_confirm.is_some();
-        if !self.shown || self.cfg.topmost || busy {
+        // Hidden without a tray agent, the window could not be reopened.
+        if !self.shown || self.cfg.topmost || busy || !self.away_allowed() {
             self.away.reset();
             return;
         }
@@ -418,6 +422,15 @@ impl QuickPanel {
                 let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
             }
         }
+    }
+
+    /// Auto-hide needs the tray agent (its icon reopens the window); checked
+    /// at most every 2 s.
+    fn away_allowed(&mut self) -> bool {
+        if self.tray_checked.is_none_or(|(t, _)| t.elapsed() > Duration::from_secs(2)) {
+            self.tray_checked = Some((Instant::now(), crate::tray::is_running()));
+        }
+        self.tray_checked.is_some_and(|(_, running)| running)
     }
 
     /// Resizes to the content, keeps the window in its corner and shows it
@@ -447,6 +460,15 @@ impl QuickPanel {
         let data = !self.worker.shared.lock().history.is_empty() || self.started.elapsed() > Duration::from_secs(2);
         if !self.shown && data && !resized && self.frames >= 3 {
             self.shown = true;
+            // Tray-only (no taskbar button) only while the tray agent runs;
+            // without it the taskbar button is the way back to the window.
+            if crate::tray::is_running() {
+                if let Some(hwnd) = crate::tray::find_own_window(&self.title) {
+                    crate::tray::tray_only(hwnd);
+                }
+            } else {
+                tracing::warn!("tray agent not running: main window keeps its taskbar button");
+            }
             theme::title_bar(&self.title, self.dark);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -454,7 +476,6 @@ impl QuickPanel {
         if self.shown && !self.marked {
             if let Some(hwnd) = crate::tray::find_own_window(&self.title) {
                 set_prop(hwnd, MARK_PROP, 1);
-                crate::tray::tray_only(hwnd);
                 self.marked = true;
             }
         }

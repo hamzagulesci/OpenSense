@@ -140,7 +140,7 @@ impl UpdatesApp {
         let status_pos = Pos2::new(bar.left() + 10.0, bar.center().y);
         match state {
             State::Latest(r) if updates::is_newer(&r.version, current) => {
-                if let Some(zip) = r.zip.clone() {
+                if let (Some(zip), Some(sha)) = (r.zip.clone(), r.zip_sha256.clone()) {
                     if ui::row_button(
                         ui,
                         button,
@@ -155,7 +155,7 @@ impl UpdatesApp {
                         let version = r.version.clone();
                         *s.lock().unwrap() = State::Installing;
                         std::thread::spawn(move || {
-                            *s.lock().unwrap() = match updates::install(&zip) {
+                            *s.lock().unwrap() = match updates::install(&zip, Some(&sha)) {
                                 Ok(()) => State::Installed(version),
                                 Err(e) => State::Failed(e),
                             };

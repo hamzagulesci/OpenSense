@@ -87,10 +87,53 @@ fn single_instance(name: windows::core::PCWSTR, relaunched: bool) -> bool {
     false
 }
 
+/// Log file for this process: `tray.log` for the agent, `app.log` for the
+/// windows, in `%APPDATA%\OpenSense\logs`. A file over 512 KB is moved to
+/// `*.old.log` at start, so at most two files per role are kept.
+fn log_file() -> Option<std::fs::File> {
+    let dir = opensense_sys::config::AppConfig::path()?.parent()?.parent()?.join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    let role = if std::env::args().any(|a| a == "--tray" || a == "--minimized") { "tray" } else { "app" };
+    let path = dir.join(format!("{role}.log"));
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 512 * 1024) {
+        let _ = std::fs::rename(&path, dir.join(format!("{role}.old.log")));
+    }
+    std::fs::OpenOptions::new().create(true).append(true).open(path).ok()
+}
+
+/// Logs to the file (and stderr in debug builds); panics are logged too,
+/// so a crash leaves a trace instead of disappearing silently.
+fn init_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_env("OPENSENSE_LOG").unwrap_or_else(|_| "info".into());
+    match log_file() {
+        Some(f) => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(f))
+            .init(),
+        None => tracing_subscriber::fmt().with_env_filter(filter).init(),
+    }
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!("panic: {info}");
+        default(info);
+    }));
+}
+
 fn main() -> eframe::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("OPENSENSE_LOG").unwrap_or_else(|_| "info".into()))
-        .init();
+    init_logging();
+    // Used by the installer before it replaces or removes the files: ask
+    // the tray agent to quit (it restores the fans) and wait up to 5 s.
+    if std::env::args().any(|a| a == "--quit") {
+        tray::request_quit();
+        for _ in 0..50 {
+            if !tray::is_running() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        return Ok(());
+    }
     // Used by the installer: the language picked in the setup, then exit.
     let argv: Vec<String> = std::env::args().collect();
     if let Some(i) = argv.iter().position(|a| a == "--set-language") {
@@ -172,7 +215,6 @@ fn run_panel(transport: TransportKind, relaunched: bool) -> eframe::Result<()> {
         .with_resizable(false)
         .with_maximize_button(false)
         .with_minimize_button(false)
-        .with_taskbar(false)
         .with_visible(false)
         .with_icon(egui::IconData { rgba: icon::rgba(64), width: 64, height: 64 });
     if cfg.topmost {

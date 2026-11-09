@@ -11,6 +11,7 @@
 *.zip
 
 # Third-party reference sources, not part of OpenSense
+/.references/
 /g-helper-main/
 /g-helper-0.291/
 

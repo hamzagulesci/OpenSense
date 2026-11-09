@@ -16,8 +16,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Check the tag matches the version
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ("v$version" -ne "${{ github.ref_name }}") { throw "tag ${{ github.ref_name }} does not match Cargo.toml version $version" }
+      - name: Test
+        run: cargo test --workspace --locked
       - name: Build
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace --locked
       - name: Package zip
         shell: pwsh
         run: |
@@ -36,9 +43,14 @@ jobs:
           $version = "${{ github.ref_name }}".TrimStart("v")
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" installer/opensense.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem dist -File | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name } | Set-Content -Encoding ascii dist/SHA256SUMS.txt
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/OpenSense-${{ github.ref_name }}-setup.exe
             dist/OpenSense-${{ github.ref_name }}-windows-x64.zip
+            dist/SHA256SUMS.txt
           generate_release_notes: true

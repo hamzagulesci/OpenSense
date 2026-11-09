@@ -220,8 +220,16 @@ pub fn normalize(mut c: Curve) -> Curve {
     c
 }
 
+/// Curve from the settings file. The safety floor is applied here too, so
+/// a hand-edited file cannot set hot temperatures to slow fans.
 pub fn from_stored(v: &[[u8; 2]]) -> Option<Curve> {
-    (v.len() == 8).then(|| normalize(std::array::from_fn(|i| [f32::from(v[i][0]), f32::from(v[i][1])])))
+    (v.len() == 8).then(|| {
+        let mut c = normalize(std::array::from_fn(|i| [f32::from(v[i][0]), f32::from(v[i][1])]));
+        for p in &mut c {
+            p[1] = p[1].clamp(0.0, 100.0).max(safety_min(p[0]));
+        }
+        c
+    })
 }
 
 pub fn to_stored(c: &Curve) -> Vec<[u8; 2]> {
@@ -275,7 +283,22 @@ pub struct FanLoop {
     /// Duty last written and the temperature it was chosen at, per fan.
     state: [Option<(u8, f32)>; 2],
     last_write: Option<Instant>,
+    /// Consecutive ticks without any temperature.
+    missing: u32,
 }
+
+/// What the fan loop wants written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FanStep {
+    Custom(CustomFan),
+    /// Temperatures are gone: hand the fans back to the firmware, which
+    /// reads its own sensors, rather than keep a speed chosen blind.
+    Auto,
+}
+
+/// Ticks (seconds) without any temperature before the fans go back to the
+/// firmware's own control.
+pub const MISSING_LIMIT: u32 = 5;
 
 /// Degrees the temperature has to drop before the fans slow down.
 const HYSTERESIS_DOWN: f32 = 3.0;
@@ -291,8 +314,21 @@ impl FanLoop {
         self.last_write.is_some()
     }
 
-    /// Next fan speeds, or `None` when nothing needs to be written.
-    pub fn step(&mut self, curves: [&Curve; 2], temps: [Option<u16>; 2], now: Instant) -> Option<CustomFan> {
+    /// Next fan speeds, or `None` when nothing needs to be written. A fan
+    /// whose own temperature is missing follows the other one; with none
+    /// for [`MISSING_LIMIT`] ticks the loop gives the fans back to the
+    /// firmware ([`FanStep::Auto`]) and nothing stale is re-sent meanwhile.
+    pub fn step(&mut self, curves: [&Curve; 2], temps: [Option<u16>; 2], now: Instant) -> Option<FanStep> {
+        let temps = [temps[0].or(temps[1]), temps[1].or(temps[0])];
+        if temps[0].is_none() {
+            self.missing += 1;
+            if self.missing >= MISSING_LIMIT && self.active() {
+                self.reset();
+                return Some(FanStep::Auto);
+            }
+            return None;
+        }
+        self.missing = 0;
         let mut changed = false;
         for i in 0..2 {
             let Some(t) = temps[i].map(f32::from) else { continue };
@@ -314,9 +350,9 @@ impl FanLoop {
         if !(changed || due) {
             return None;
         }
-        let (cpu, gpu) = (self.state[0]?, self.state[1].or(self.state[0])?);
+        let (cpu, gpu) = (self.state[0]?, self.state[1]?);
         self.last_write = Some(now);
-        Some(CustomFan { cpu_percent: Some(cpu.0), gpu_percent: Some(gpu.0) })
+        Some(FanStep::Custom(CustomFan { cpu_percent: Some(cpu.0), gpu_percent: Some(gpu.0) }))
     }
 }
 
@@ -368,15 +404,62 @@ mod tests {
         let c = table([30, 40, 50, 60, 70, 80, 90, 100], [0, 10, 20, 30, 40, 50, 60, 70]);
         let mut l = FanLoop::default();
         let t0 = Instant::now();
-        let first = l.step([&c, &c], [Some(60), Some(50)], t0).unwrap();
+        let custom = |s: Option<FanStep>| match s {
+            Some(FanStep::Custom(f)) => f,
+            other => panic!("expected custom speeds, got {other:?}"),
+        };
+        let first = custom(l.step([&c, &c], [Some(60), Some(50)], t0));
         assert_eq!((first.cpu_percent, first.gpu_percent), (Some(30), Some(20)));
         // Rising writes at once.
         assert!(l.step([&c, &c], [Some(65), Some(50)], t0).is_some());
         // Dropping 2 °C keeps the speed, 3 °C lowers it.
         assert!(l.step([&c, &c], [Some(63), Some(50)], t0).is_none());
-        let down = l.step([&c, &c], [Some(62), Some(50)], t0).unwrap();
+        let down = custom(l.step([&c, &c], [Some(62), Some(50)], t0));
         assert_eq!(down.cpu_percent, Some(32));
         // Re-sent after 30 s even without change.
         assert!(l.step([&c, &c], [Some(62), Some(50)], t0 + Duration::from_secs(31)).is_some());
+    }
+
+    fn flat(d: f32) -> Curve {
+        std::array::from_fn(|i| [30.0 + 10.0 * i as f32, d])
+    }
+
+    #[test]
+    fn fan_loop_hands_back_to_firmware_when_sensors_vanish() {
+        let c = flat(40.0);
+        let mut l = FanLoop::default();
+        let t0 = Instant::now();
+        assert!(matches!(l.step([&c, &c], [Some(60), Some(55)], t0), Some(FanStep::Custom(_))));
+        // A few missing readings: nothing is written (no stale re-send).
+        for k in 1..MISSING_LIMIT {
+            assert_eq!(l.step([&c, &c], [None, None], t0 + Duration::from_secs(40 * u64::from(k))), None);
+        }
+        assert_eq!(l.step([&c, &c], [None, None], t0 + Duration::from_secs(400)), Some(FanStep::Auto));
+        assert!(!l.active());
+        // Still no readings: Auto is not repeated.
+        assert_eq!(l.step([&c, &c], [None, None], t0 + Duration::from_secs(401)), None);
+        // Readings back: the curve takes over again.
+        assert!(matches!(
+            l.step([&c, &c], [Some(60), Some(55)], t0 + Duration::from_secs(402)),
+            Some(FanStep::Custom(_))
+        ));
+    }
+
+    #[test]
+    fn fan_loop_uses_the_other_temperature_when_one_is_missing() {
+        let cpu = flat(30.0);
+        let gpu = flat(50.0);
+        let mut l = FanLoop::default();
+        let step = l.step([&cpu, &gpu], [Some(60), None], Instant::now());
+        assert_eq!(step, Some(FanStep::Custom(CustomFan { cpu_percent: Some(30), gpu_percent: Some(50) })));
+    }
+
+    #[test]
+    fn stored_curve_keeps_the_safety_floor() {
+        // Hand-edited: 0 % at 100 °C.
+        let stored: Vec<[u8; 2]> = (0..8).map(|i| [30 + 10 * i as u8, 0]).collect();
+        let c = from_stored(&stored).unwrap();
+        assert!(c[7][1] >= safety_min(100.0));
+        assert_eq!(c[0][1], 0.0);
     }
 }

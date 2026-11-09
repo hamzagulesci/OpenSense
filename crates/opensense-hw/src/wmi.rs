@@ -114,7 +114,20 @@ impl WmiTransport {
     fn call(&self, method: GamingMethod, input: Input) -> Result<Output, HwError> {
         let (reply, rx) = bounded(1);
         self.tx.send(Request::Gaming { method, input, reply }).map_err(|_| HwError::Wmi("WMI worker exited".into()))?;
-        rx.recv().map_err(|_| HwError::Wmi("WMI worker exited".into()))?
+        wait_reply(&rx)
+    }
+}
+
+/// Longest a firmware call may take. A call that hangs (ACPI stuck after
+/// resume, WMI service restarting) then fails instead of blocking the
+/// caller forever; the caller reconnects, which starts a fresh WMI thread.
+const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn wait_reply<T>(rx: &crossbeam_channel::Receiver<Result<T, HwError>>) -> Result<T, HwError> {
+    match rx.recv_timeout(CALL_TIMEOUT) {
+        Ok(r) => r,
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(HwError::Wmi("firmware call timed out".into())),
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(HwError::Wmi("WMI worker exited".into())),
     }
 }
 
@@ -173,7 +186,7 @@ impl GamingTransport for WmiTransport {
         self.tx
             .send(Request::Raw { class, method, inputs: inputs.to_vec(), outputs: outputs.to_vec(), reply })
             .map_err(|_| HwError::Wmi("WMI worker exited".into()))?;
-        rx.recv().map_err(|_| HwError::Wmi("WMI worker exited".into()))?
+        wait_reply(&rx)
     }
 }
 

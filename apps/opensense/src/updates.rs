@@ -15,6 +15,8 @@ pub struct Release {
     pub version: String,
     pub page: String,
     pub zip: Option<String>,
+    /// SHA-256 of the zip as published by GitHub (lowercase hex).
+    pub zip_sha256: Option<String>,
 }
 
 fn hidden(cmd: &mut Command) -> &mut Command {
@@ -39,13 +41,20 @@ fn json_str<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 pub fn parse_release(json: &str) -> Option<Release> {
     let version = json_str(json, "tag_name")?.trim_start_matches(['v', 'V']).to_owned();
     let page = json_str(json, "html_url").unwrap_or(REPO).to_owned();
-    // The Windows zip among the assets.
-    let zip = json
-        .match_indices("\"browser_download_url\"")
-        .filter_map(|(i, _)| json_str(&json[i..], "browser_download_url"))
-        .find(|u| u.ends_with(".zip") && u.contains("windows"))
-        .map(str::to_owned);
-    Some(Release { version, page, zip })
+    // The Windows zip among the assets, with its digest. Each asset object
+    // starts with its API url (".../releases/assets/<id>"), so splitting
+    // there keeps every digest with its own download url.
+    let asset = json
+        .split("/releases/assets/")
+        .skip(1)
+        .find(|a| json_str(a, "browser_download_url").is_some_and(|u| u.ends_with(".zip") && u.contains("windows")));
+    let zip = asset.and_then(|a| json_str(a, "browser_download_url")).map(str::to_owned);
+    let zip_sha256 = asset
+        .and_then(|a| json_str(a, "digest"))
+        .and_then(|d| d.strip_prefix("sha256:"))
+        .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase);
+    Some(Release { version, page, zip, zip_sha256 })
 }
 
 /// Latest published release, or `None` when offline.
@@ -86,10 +95,23 @@ pub fn cleanup() {
     }
 }
 
-/// Downloads the release zip and replaces the executables next to this
-/// one. Running executables are renamed first (Windows allows that), so
-/// the new files take effect on the next start.
-pub fn install(zip_url: &str) -> Result<(), String> {
+/// SHA-256 of a file as lowercase hex.
+fn sha256_file(path: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut f, &mut hasher).map_err(|e| e.to_string())?;
+    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Downloads the release zip, checks it against the SHA-256 GitHub
+/// published for it, and replaces the executables next to this one.
+/// Running executables are renamed first (Windows allows that), so the new
+/// files take effect on the next start. Without a published digest
+/// nothing is installed. If replacing any file fails, every file already
+/// replaced is put back.
+pub fn install(zip_url: &str, sha256: Option<&str>) -> Result<(), String> {
+    let expected = sha256.ok_or("the release publishes no checksum for the download")?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let dir = exe.parent().ok_or("no folder")?.to_path_buf();
     let work: PathBuf = std::env::temp_dir().join("opensense-update");
@@ -102,6 +124,12 @@ pub fn install(zip_url: &str) -> Result<(), String> {
     if !ok {
         return Err("download failed".into());
     }
+    let actual = sha256_file(&zip)?;
+    if !actual.eq_ignore_ascii_case(expected) {
+        let _ = std::fs::remove_dir_all(&work);
+        tracing::warn!("update rejected: checksum {actual} does not match {expected}");
+        return Err("the download is damaged or was altered (checksum mismatch)".into());
+    }
     let unpacked = work.join("files");
     let script =
         format!("Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force", zip.display(), unpacked.display());
@@ -111,24 +139,34 @@ pub fn install(zip_url: &str) -> Result<(), String> {
     if !ok {
         return Err("cannot unpack the update".into());
     }
-    let mut replaced = 0;
+    // (new file, backup of the old one) for every file replaced so far.
+    let mut replaced: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let rollback = |replaced: &[(PathBuf, PathBuf)]| {
+        for (dst, old) in replaced.iter().rev() {
+            let _ = std::fs::remove_file(dst);
+            let _ = std::fs::rename(old, dst);
+        }
+    };
     for name in ["opensense.exe", "opensense-cli.exe"] {
         let Some(src) = find(&unpacked, name) else { continue };
         let dst = dir.join(name);
         let old = dir.join(format!("{name}.old"));
         let _ = std::fs::remove_file(&old);
         if dst.exists() {
-            std::fs::rename(&dst, &old).map_err(|e| format!("{name}: {e}"))?;
+            if let Err(e) = std::fs::rename(&dst, &old) {
+                rollback(&replaced);
+                return Err(format!("{name}: {e}"));
+            }
         }
         if let Err(e) = std::fs::copy(&src, &dst) {
-            // Put the old file back.
             let _ = std::fs::rename(&old, &dst);
+            rollback(&replaced);
             return Err(format!("{name}: {e}"));
         }
-        replaced += 1;
+        replaced.push((dst, old));
     }
     let _ = std::fs::remove_dir_all(&work);
-    if replaced == 0 {
+    if replaced.is_empty() {
         return Err("the update contains no OpenSense files".into());
     }
     Ok(())
@@ -200,13 +238,51 @@ mod tests {
         assert!(!is_newer("0.1", "0.1.0"));
     }
 
+    const HASH_SETUP: &str = "be3ade783b0f6f8283e3b4f1d5c40aa0da3f4ee0b8431fa77316d9532d8ba1e6";
+    const HASH_ZIP: &str = "11A8C798AF7DDA1982A47F9D1CAFCC25870BB3C57E7D6C2011A3447E810DB4A8";
+
+    /// Shape of GitHub's releases/latest answer (trimmed).
+    fn release_json(zip_digest: &str) -> String {
+        format!(
+            r#"{{"url":"https://api.github.com/repos/a/b/releases/1","html_url":"https://github.com/a/b/releases/tag/v0.2.0","tag_name":"v0.2.0",
+            "assets":[
+              {{"url":"https://api.github.com/repos/a/b/releases/assets/2","name":"OpenSense-v0.2.0-setup.exe",
+                "uploader":{{"url":"https://api.github.com/users/x"}},"digest":"sha256:{HASH_SETUP}",
+                "browser_download_url":"https://github.com/a/b/releases/download/v0.2.0/OpenSense-v0.2.0-setup.exe"}},
+              {{"url":"https://api.github.com/repos/a/b/releases/assets/3","name":"OpenSense-v0.2.0-windows-x64.zip",
+                "uploader":{{"url":"https://api.github.com/users/x"}},{zip_digest}
+                "browser_download_url":"https://github.com/a/b/releases/download/v0.2.0/OpenSense-v0.2.0-windows-x64.zip"}}]}}"#
+        )
+    }
+
     #[test]
     fn parses_release_json() {
-        let json = r#"{"url":"x","html_url":"https://github.com/a/b/releases/tag/v0.2.0","tag_name":"v0.2.0",
-            "assets":[{"browser_download_url":"https://github.com/a/b/releases/download/v0.2.0/OpenSense-v0.2.0-windows-x64.zip"}]}"#;
-        let r = parse_release(json).unwrap();
+        let r = parse_release(&release_json(&format!(r#""digest":"sha256:{HASH_ZIP}","#))).unwrap();
         assert_eq!(r.version, "0.2.0");
         assert!(r.page.ends_with("v0.2.0"));
         assert!(r.zip.unwrap().ends_with("windows-x64.zip"));
+        // The zip's own digest, not the installer's listed before it.
+        assert_eq!(r.zip_sha256.as_deref(), Some(HASH_ZIP.to_ascii_lowercase().as_str()));
+    }
+
+    #[test]
+    fn missing_or_malformed_digest_is_none() {
+        assert_eq!(parse_release(&release_json("")).unwrap().zip_sha256, None);
+        let bad = parse_release(&release_json(r#""digest":"sha256:1234","#)).unwrap();
+        assert_eq!(bad.zip_sha256, None);
+    }
+
+    #[test]
+    fn install_refuses_without_checksum() {
+        assert!(install("https://invalid.example/x.zip", None).unwrap_err().contains("checksum"));
+    }
+
+    #[test]
+    fn sha256_of_file() {
+        let path = std::env::temp_dir().join("opensense-sha-test.txt");
+        std::fs::write(&path, b"abc").unwrap();
+        let h = sha256_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(h, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     }
 }

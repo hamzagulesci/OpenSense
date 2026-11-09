@@ -417,6 +417,8 @@ struct Tick {
     cap: Option<bool>,
     percent: Option<u8>,
     temps: [Option<u16>; 2],
+    /// Firmware connections made so far (see `Snapshot::connects`).
+    connects: u32,
     tip: String,
 }
 
@@ -444,8 +446,51 @@ fn read_tick(worker: &worker::WorkerHandle, cfg: &AppConfig, lang: Lang) -> Tick
         gpu: s.gpu_mux_supported.then_some(s.gpu_mode.unwrap_or(GpuMode::Hybrid)),
         cap: s.battery.filter(|b| b.limit_supported).map(|b| b.limit_active),
         percent: s.power.battery_percent,
-        temps: [s.readings.cpu_temp, s.readings.gpu_temp],
+        // Readings the worker has not refreshed for a few seconds (stuck
+        // firmware call) count as missing, so they cannot drive the fans.
+        temps: if s.readings_at.is_some_and(|t| t.elapsed() < STALE_AFTER) {
+            [s.readings.cpu_temp, s.readings.gpu_temp]
+        } else {
+            [None, None]
+        },
+        connects: s.connects,
         tip,
+    }
+}
+
+/// Sensor readings older than this are not used for the fan curve.
+const STALE_AFTER: Duration = Duration::from_secs(5);
+
+/// A gap this long between 1 s timer ticks means the PC slept.
+const RESUME_GAP: Duration = Duration::from_secs(20);
+
+/// Gives the fans back to their saved setting (normally Auto) when the
+/// agent stops while a software curve drives them: on a normal quit and
+/// also on a panic, since the guard is dropped while unwinding. It talks
+/// to the firmware over its own connection, so it works even when the
+/// worker thread is stuck or gone.
+struct FanGuard {
+    kind: TransportKind,
+    profile: opensense_hw::device::DeviceProfile,
+    /// Setting to restore; `None` while no curve is active.
+    restore: Option<opensense_sys::config::FanConfig>,
+}
+
+impl Drop for FanGuard {
+    fn drop(&mut self) {
+        let Some(fan) = self.restore.take() else { return };
+        let result = opensense_hw::open_transport(self.kind).and_then(|t| {
+            let dev = opensense_hw::NitroDevice::new(t, self.profile.clone());
+            match crate::apply::fan(&fan) {
+                Command::FansMax => dev.set_fans_max(),
+                Command::FansCustom(c) => dev.set_fans_custom(c),
+                _ => dev.set_fans_auto(),
+            }
+        });
+        match result {
+            Ok(()) => tracing::info!("fan curve stopped: fans restored to {:?}", fan.mode),
+            Err(e) => tracing::error!("fan curve stopped but the fans could not be restored: {e}"),
+        }
     }
 }
 
@@ -499,10 +544,12 @@ pub fn run(kind: TransportKind) {
     let Ok(quit_event) = (unsafe { CreateEventW(None, false, false, QUIT_EVENT) }) else { return };
 
     let worker = worker::spawn(kind, &oem, Duration::from_secs(1), 4, false, || {});
+    let mut guard = FanGuard { kind, profile: worker::device_profile(&oem), restore: None };
+    // Saved firmware settings are sent whenever a connection is made (first
+    // connect, reconnect) and after resume; see the timer tick below.
+    let mut applied_connects = 0u32;
+    let mut last_tick = std::time::Instant::now();
     if cfg.apply_on_start {
-        for c in crate::apply::saved_state(&cfg, &oem) {
-            let _ = worker.tx.send(c);
-        }
         let key = crate::modes::current_key(&cfg);
         let (p, base) = (crate::modes::profile(&cfg, &key), crate::modes::base_of(&cfg, &key));
         std::thread::spawn(move || crate::modes::apply_windows(&p, base));
@@ -616,6 +663,25 @@ pub fn run(kind: TransportKind) {
             let _ = tray.set_tooltip(Some(now.tip.clone()));
             close_idle_main_window();
 
+            // Back from sleep, or connected (again) to the firmware: it may
+            // have reset mode, lighting and the charge cap, so send them.
+            let resumed = last_tick.elapsed() > RESUME_GAP;
+            last_tick = std::time::Instant::now();
+            if resumed {
+                tracing::info!("resumed from sleep: re-applying settings");
+            }
+            if resumed || now.connects != applied_connects {
+                applied_connects = now.connects;
+                if cfg.apply_on_start && now.connects > 0 {
+                    for c in crate::apply::saved_state(&cfg, &oem) {
+                        let _ = worker.tx.send(c);
+                    }
+                }
+                fan_loop.reset();
+                // The firmware may report a stale mode for a while.
+                last_switch = std::time::Instant::now();
+            }
+
             // Software fan curve of the current mode.
             let key = crate::modes::current_key(&cfg);
             let profile = crate::modes::profile(&cfg, &key);
@@ -623,14 +689,22 @@ pub fn run(kind: TransportKind) {
                 let c = crate::modes::from_stored(&profile.cpu_curve);
                 let g = crate::modes::from_stored(&profile.gpu_curve);
                 if let (Some(c), Some(g)) = (c, g) {
-                    if let Some(f) = fan_loop.step([&c, &g], now.temps, std::time::Instant::now()) {
-                        let _ = worker.tx.send(Command::FansCustom(f));
+                    match fan_loop.step([&c, &g], now.temps, std::time::Instant::now()) {
+                        Some(crate::modes::FanStep::Custom(f)) => {
+                            let _ = worker.tx.send(Command::FansCustom(f));
+                        }
+                        Some(crate::modes::FanStep::Auto) => {
+                            tracing::warn!("no temperature readings: fans handed back to the firmware");
+                            let _ = worker.tx.send(Command::FansAuto);
+                        }
+                        None => {}
                     }
                 }
             } else if fan_loop.active() {
                 fan_loop.reset();
                 let _ = worker.tx.send(crate::apply::fan(&cfg.fan));
             }
+            guard.restore = fan_loop.active().then(|| cfg.fan.clone());
 
             charge_tick(&mut cfg, &worker, now.cap, now.percent);
 
@@ -638,7 +712,8 @@ pub fn run(kind: TransportKind) {
             // follow it so every window shows the real mode.
             seen_mode = if seen_mode.0 == now.mode { (now.mode, seen_mode.1 + 1) } else { (now.mode, 1) };
             if let Some(m) = now.mode.filter(|_| seen_mode.1 >= 3) {
-                let builtin = crate::modes::base_mode(&key).is_some();
+                let builtin =
+                    crate::modes::base_mode(&key).is_some() && crate::modes::BUILTIN.iter().any(|(_, b)| *b == m);
                 let settled = last_switch.elapsed() > Duration::from_secs(10);
                 if builtin && settled && crate::modes::base_of(&cfg, &key) != m {
                     cfg.current_mode = Some(m.label().to_ascii_lowercase());
@@ -735,14 +810,13 @@ pub fn run(kind: TransportKind) {
         }
     }
     drop(overlay);
-    if fan_loop.active() {
-        let _ = worker.tx.send(crate::apply::fan(&cfg.fan));
-        std::thread::sleep(Duration::from_millis(300));
-    }
+    // The guard restores the fans synchronously when it is dropped below.
+    guard.restore = fan_loop.active().then(|| cfg.fan.clone());
     unsafe {
         let _ = KillTimer(None, timer);
         let _ = CloseHandle(config_event);
         let _ = CloseHandle(quit_event);
     }
     drop(tray);
+    drop(guard);
 }

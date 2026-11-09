@@ -39,6 +39,12 @@ pub struct Sample {
 #[derive(Debug, Default)]
 pub struct Snapshot {
     pub connected: bool,
+    /// Successful firmware connections so far; a change means the
+    /// connection was (re)established and saved settings should be sent.
+    pub connects: u32,
+    /// When `readings` were last read successfully. Readings older than a
+    /// few seconds mean the worker is stuck and must not drive the fans.
+    pub readings_at: Option<Instant>,
     pub transport: String,
     /// Probed once after connecting.
     pub caps: Option<Capabilities>,
@@ -89,11 +95,7 @@ pub fn spawn(
 ) -> WorkerHandle {
     let (tx, rx) = crossbeam_channel::unbounded();
     let shared: Shared = Arc::new(Mutex::new(Snapshot::default()));
-    let profile = DeviceProfile {
-        backlight_hotkey: oem.backlight_hotkey,
-        zone_color_adjust: oem.zone_color_adjust,
-        pd_support: oem.pd_support,
-    };
+    let profile = device_profile(oem);
     let s = shared.clone();
     std::thread::Builder::new()
         .name("opensense-hw".into())
@@ -101,6 +103,18 @@ pub fn spawn(
         .expect("spawn worker");
     WorkerHandle { tx, shared }
 }
+
+/// Model-specific settings for [`NitroDevice`].
+pub fn device_profile(oem: &OemInfo) -> DeviceProfile {
+    DeviceProfile {
+        backlight_hotkey: oem.backlight_hotkey,
+        zone_color_adjust: oem.zone_color_adjust,
+        pd_support: oem.pd_support,
+    }
+}
+
+/// Seconds between connection attempts while the firmware is unreachable.
+const RECONNECT_EVERY: u64 = 5;
 
 struct Worker {
     dev: Option<NitroDevice>,
@@ -126,26 +140,17 @@ impl Worker {
         monitors: bool,
         repaint: Box<dyn Fn() + Send>,
     ) -> Self {
-        let dev = match open_transport(kind) {
-            Ok(t) => Some(NitroDevice::new(t, profile.clone())),
-            Err(e) => {
-                tracing::warn!("hardware unavailable: {e}");
-                shared.lock().hw_error = Some(e.to_string());
-                None
-            }
-        };
         let cpu = monitors.then(CpuMonitor::new);
         {
             let mut s = shared.lock();
-            s.connected = dev.is_some();
-            s.transport = dev.as_ref().map(|d| d.transport_name().to_owned()).unwrap_or_else(|| "none".into());
+            s.transport = "none".into();
             s.cpu_name = cpu.as_ref().map(|c| c.brand()).unwrap_or_default();
             if monitors {
                 s.gpu_name = opensense_sys::gpu_name::discrete_gpu_name();
             }
         }
-        Self {
-            dev,
+        let mut w = Self {
+            dev: None,
             shared,
             history_len: history_len.max(10),
             repaint,
@@ -156,6 +161,37 @@ impl Worker {
             kind,
             profile,
             failures: 0,
+        };
+        w.connect();
+        w
+    }
+
+    /// Opens the firmware connection; true on success.
+    fn connect(&mut self) -> bool {
+        match open_transport(self.kind) {
+            Ok(t) => {
+                let dev = NitroDevice::new(t, self.profile.clone());
+                let mut s = self.shared.lock();
+                s.connected = true;
+                s.connects += 1;
+                s.hw_error = None;
+                s.transport = dev.transport_name().to_owned();
+                drop(s);
+                if self.dev.is_some() {
+                    tracing::info!("reconnected to the firmware");
+                }
+                self.dev = Some(dev);
+                true
+            }
+            Err(e) => {
+                let mut s = self.shared.lock();
+                if s.hw_error.as_deref() != Some(&e.to_string()) {
+                    tracing::warn!("hardware unavailable: {e}");
+                }
+                s.connected = self.dev.is_some();
+                s.hw_error = Some(e.to_string());
+                false
+            }
         }
     }
 
@@ -236,6 +272,11 @@ impl Worker {
 
     fn poll(&mut self) {
         self.tick += 1;
+        // Not connected yet (WMI slow at sign-in, firmware busy): keep
+        // trying instead of staying offline until the next start.
+        if self.dev.is_none() && self.tick.is_multiple_of(RECONNECT_EVERY) && self.connect() {
+            self.refresh_state();
+        }
         let readings = match self.dev.as_ref().map(|d| d.readings()) {
             Some(Ok(r)) => {
                 self.failures = 0;
@@ -252,10 +293,7 @@ impl Worker {
                 }
                 if self.failures >= 3 {
                     self.failures = 0;
-                    if let Ok(t) = open_transport(self.kind) {
-                        tracing::info!("reconnected to the firmware");
-                        self.dev = Some(NitroDevice::new(t, self.profile.clone()));
-                    }
+                    self.connect();
                 }
                 None
             }
@@ -275,6 +313,7 @@ impl Worker {
         let mut s = self.shared.lock();
         if let Some(r) = readings {
             s.readings = r;
+            s.readings_at = Some(Instant::now());
             s.hw_error = None;
         }
         s.cpu = cpu;

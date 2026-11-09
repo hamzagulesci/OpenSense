@@ -300,10 +300,57 @@ impl AppConfig {
             std::fs::create_dir_all(dir)?;
         }
         let text = toml::to_string_pretty(self).map_err(|e| SysError::Config(e.to_string()))?;
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, text)?;
-        std::fs::rename(tmp, path)?;
+        // Several OpenSense processes save this file: one writer at a
+        // time, each with its own temp file, flushed before the rename so
+        // a crash or power loss leaves the old or the new file, never half.
+        let _lock = WriteLock::acquire();
+        let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+        let written = (|| {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(text.as_bytes())?;
+            f.sync_all()
+        })();
+        if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, &path)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
+    }
+}
+
+/// Cross-process lock around config writes (a named mutex; released when
+/// dropped). Waits at most 2 s, then writes anyway rather than lose the
+/// change.
+struct WriteLock(#[cfg(windows)] Option<windows::Win32::Foundation::HANDLE>);
+
+impl WriteLock {
+    fn acquire() -> Self {
+        #[cfg(windows)]
+        {
+            use windows::core::w;
+            use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+            let h = unsafe { CreateMutexW(None, false, w!("Local\\OpenSense.ConfigWrite")) }.ok();
+            if let Some(h) = h {
+                // WAIT_OBJECT_0 or WAIT_ABANDONED both mean we own it now.
+                let _ = unsafe { WaitForSingleObject(h, 2000) };
+            }
+            Self(h)
+        }
+        #[cfg(not(windows))]
+        Self()
+    }
+}
+
+impl Drop for WriteLock {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        if let Some(h) = self.0 {
+            unsafe {
+                let _ = windows::Win32::System::Threading::ReleaseMutex(h);
+                let _ = windows::Win32::Foundation::CloseHandle(h);
+            }
+        }
     }
 }
 
