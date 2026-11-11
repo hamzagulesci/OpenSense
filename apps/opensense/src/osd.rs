@@ -11,7 +11,7 @@ use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, DrawTextW, GetDC, ReleaseDC,
     SelectObject, SetBkMode, SetTextColor, AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BITMAPINFO,
     BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER,
-    DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_BOLD, OUT_DEFAULT_PRECIS, TRANSPARENT,
+    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_BOLD, OUT_DEFAULT_PRECIS, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -213,7 +213,7 @@ fn text_coverage(text: &str, w: i32, h: i32, scale: f32) -> Vec<f32> {
             SetTextColor(dc, COLORREF(0x00FF_FFFF));
             let mut r = RECT { left: 0, top: 0, right: w, bottom: h };
             let mut wide: Vec<u16> = HSTRING::from(text).as_wide().to_vec();
-            DrawTextW(dc, &mut wide, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DrawTextW(dc, &mut wide, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             let px = std::slice::from_raw_parts(bits.cast::<u32>(), (w * h) as usize);
             for (c, p) in cov.iter_mut().zip(px) {
                 let (r, g, b) = ((p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF);

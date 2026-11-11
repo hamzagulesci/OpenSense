@@ -34,25 +34,45 @@ pub fn info() -> Option<(String, u32)> {
 }
 
 /// Locks the graphics clock to at most `limit` MHz, or removes the lock.
-pub fn apply_clock_limit(limit: Option<u32>) {
+///
+/// The lock is held across the `nvidia-smi` run so two mode switches in
+/// quick succession apply in order, and the state is recorded only when
+/// the tool succeeded (a failure is retried next time). `force` runs the
+/// tool even when this process believes nothing changed: a lock set by
+/// another OpenSense process (the tray agent) is not visible here.
+pub fn set_clock_limit(limit: Option<u32>, force: bool) {
     let limit = limit.filter(|&l| l < CLOCK_MAX);
-    {
-        let mut applied = APPLIED.lock().unwrap();
+    let mut applied = APPLIED.lock().unwrap_or_else(|e| e.into_inner());
+    if !force {
         if *applied == Some(limit) {
             return;
         }
-        // Nothing to undo when no limit was ever set by us.
+        // At start with no limit wanted: nothing of ours to undo.
         if applied.is_none() && limit.is_none() {
             *applied = Some(None);
             return;
         }
-        *applied = Some(limit);
     }
     let ok = match limit {
         Some(l) => smi(&["-lgc", &format!("0,{l}")]).is_some(),
         None => smi(&["-rgc"]).is_some(),
     };
-    if !ok {
+    if ok {
+        *applied = Some(limit);
+    } else {
         tracing::warn!("nvidia-smi could not set the clock limit {limit:?}");
+    }
+}
+
+/// Applies a mode's clock limit (skipped when already applied).
+pub fn apply_clock_limit(limit: Option<u32>) {
+    set_clock_limit(limit, false);
+}
+
+/// On exit: removes a clock lock this process set.
+pub fn release_clock_limit() {
+    let set = matches!(*APPLIED.lock().unwrap_or_else(|e| e.into_inner()), Some(Some(_)));
+    if set {
+        set_clock_limit(None, true);
     }
 }

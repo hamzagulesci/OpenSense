@@ -37,7 +37,10 @@ pub struct ExtraApp {
     away: crate::tray::AwayWatch,
     /// Running vendor services, refreshed in the background (None = busy).
     services: Arc<Mutex<Option<Vec<&'static str>>>>,
-    hibernate_min: Option<u32>,
+    /// Battery timeouts in minutes (screen off, sleep, hibernate), read from
+    /// the active Windows power plan; `None` when Windows has no value.
+    timeouts: [Option<u32>; 3],
+    timeouts_read: Instant,
     message: String,
 }
 
@@ -61,7 +64,8 @@ impl ExtraApp {
             marked: false,
             away: crate::tray::AwayWatch::default(),
             services: Arc::new(Mutex::new(None)),
-            hibernate_min: tweaks::read(setting::HIBERNATE_AFTER).ok().map(|v| v.1 / 60),
+            timeouts: read_timeouts(),
+            timeouts_read: Instant::now(),
             message: String::new(),
         };
         app.refresh_services();
@@ -105,6 +109,7 @@ impl eframe::App for ExtraApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        crate::tray::keep_tray_only();
         if !self.marked {
             if let Some(hwnd) = crate::tray::find_own_window(tr(self.lang, "Extra Settings")) {
                 crate::panel::set_prop(hwnd, MARK_PROP, 1);
@@ -120,7 +125,7 @@ impl eframe::App for ExtraApp {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        if self.checked.elapsed() > Duration::from_millis(500) {
+        if self.checked.elapsed() > Duration::from_millis(200) {
             self.checked = Instant::now();
             let m = crate::fans_window::config_mtime();
             if m != self.modified {
@@ -128,6 +133,7 @@ impl eframe::App for ExtraApp {
                 self.cfg = AppConfig::load();
                 self.lang = Lang::resolve(&self.cfg.language);
             }
+            theme::follow(ctx, &self.cfg.ui_mode, &mut self.dark, MARK_PROP);
         }
         egui::CentralPanel::default().frame(egui::Frame::none().fill(pal().form).inner_margin(5.0)).show(ctx, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
@@ -334,14 +340,18 @@ impl ExtraApp {
         let (row, _) = header_rect(ui);
         draw_header(ui, row, Icon::Gear, self.t("Other"));
         let scan = Rect::from_min_max(
-            Pos2::new(row.right() - 90.0, row.top() + 4.0),
+            Pos2::new(row.right() - 150.0, row.top() + 4.0),
             Pos2::new(row.right() - 6.0, row.bottom() - 4.0),
         );
-        if ui::row_button(ui, scan, "scan", self.t("Scan"), None, false)
-            .on_hover_text(self.t("Save a report of every firmware value and open it"))
+        if ui::row_button(ui, scan, "scan", self.t("Hardware Test"), None, false)
+            .on_hover_text(self.t("Check which features work on this laptop and create a compatibility report"))
             .clicked()
         {
-            scan_report();
+            let mock = self.worker.shared.lock().transport == "mock";
+            crate::panel::toggle_child(
+                crate::diag_window::MARK_PROP,
+                if mock { &["--diagnostics", "--mock"] } else { &["--diagnostics"] },
+            );
         }
         let mut save = false;
         let mut v = self.cfg.aspm_off;
@@ -414,49 +424,57 @@ impl ExtraApp {
         ui.add_space(8.0);
     }
 
+    /// Battery timeouts of the active Windows power plan, as in Settings >
+    /// Power & battery: read from Windows (re-read every few seconds, so a
+    /// change made there shows up) and written back when edited here.
     fn hibernate(&mut self, ui: &mut egui::Ui) {
-        let Some(mut minutes) = self.hibernate_min else { return };
-        let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW + 4.0), Sense::hover());
-        crate::gh::icons::paint(
-            ui.painter(),
-            Pos2::new(row.left() + 12.0, row.center().y),
-            16.0,
-            Icon::Battery,
-            pal().fore,
-        );
-        ui.painter().text(
-            Pos2::new(row.left() + 26.0, row.center().y),
-            Align2::LEFT_CENTER,
-            self.t("Time to hibernate in sleep on battery"),
-            theme::bold(theme::BODY),
-            pal().fore,
-        );
-        let r = Rect::from_min_max(
-            Pos2::new(row.right() - 96.0, row.top() + 4.0),
-            Pos2::new(row.right() - 10.0, row.bottom() - 4.0),
-        );
-        let (off, min) = (self.t("Off"), self.t("min"));
-        let mut changed = false;
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(r), |ui| {
-            changed = ui
-                .add_sized(
+        if self.timeouts.iter().all(Option::is_none) {
+            return;
+        }
+        header(ui, Icon::Battery, self.t("On battery"));
+        let rows: [(&'static str, (u128, u128)); 3] = [
+            ("Turn off my screen after", setting::DISPLAY_OFF_AFTER),
+            ("Put my device to sleep after", setting::SLEEP_AFTER),
+            ("Time to hibernate in sleep on battery", setting::HIBERNATE_AFTER),
+        ];
+        let (never, min) = (self.t("Never"), self.t("min"));
+        let mut editing = false;
+        for (i, (label, s)) in rows.into_iter().enumerate() {
+            let Some(mut minutes) = self.timeouts[i] else { continue };
+            let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW), Sense::hover());
+            label_left(ui, row, self.t(label), true);
+            let r = Rect::from_min_max(
+                Pos2::new(row.right() - 96.0, row.top() + 2.0),
+                Pos2::new(row.right() - 10.0, row.bottom() - 2.0),
+            );
+            let mut changed = false;
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(r), |ui| {
+                let resp = ui.add_sized(
                     r.size(),
-                    egui::DragValue::new(&mut minutes).range(0..=10_000).speed(10.0).custom_formatter(move |v, _| {
+                    egui::DragValue::new(&mut minutes).range(0..=10_000).speed(5.0).custom_formatter(move |v, _| {
                         if v == 0.0 {
-                            off.to_owned()
+                            never.to_owned()
                         } else {
                             format!("{v:.0} {min}")
                         }
                     }),
-                )
-                .drag_stopped()
-                || ui.input(|i| i.key_pressed(egui::Key::Enter));
-        });
-        self.hibernate_min = Some(minutes);
-        if changed {
-            if let Err(e) = tweaks::write(setting::HIBERNATE_AFTER, None, Some(minutes * 60)) {
-                self.message = e.to_string();
+                );
+                editing |= resp.dragged() || resp.has_focus();
+                changed = resp.drag_stopped() || resp.lost_focus();
+            });
+            self.timeouts[i] = Some(minutes);
+            // Only a real change is written: leaving the field untouched must
+            // not round a 90 s setting down to a whole minute.
+            if changed && tweaks::read(s).is_ok_and(|v| v.1 / 60 != minutes) {
+                if let Err(e) = tweaks::write(s, None, Some(minutes * 60)) {
+                    self.message = e.to_string();
+                }
+                self.timeouts_read = Instant::now();
             }
+        }
+        if !editing && self.timeouts_read.elapsed() > Duration::from_secs(3) {
+            self.timeouts = read_timeouts();
+            self.timeouts_read = Instant::now();
         }
     }
 
@@ -559,20 +577,8 @@ fn combo_row(ui: &mut egui::Ui, id: &str, label: &str, current: usize, items: &[
     (picked != current).then_some(picked)
 }
 
-/// Runs the command-line tool's firmware dump into a text file and opens it.
-fn scan_report() {
-    std::thread::spawn(|| {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let Some(cli) = std::env::current_exe().ok().map(|e| e.with_file_name("opensense-cli.exe")) else { return };
-        let Ok(out) = std::process::Command::new(&cli).arg("probe").creation_flags(CREATE_NO_WINDOW).output() else {
-            return;
-        };
-        let path = std::env::temp_dir().join("opensense-scan.txt");
-        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-        text.push_str(&String::from_utf8_lossy(&out.stderr));
-        if std::fs::write(&path, text).is_ok() {
-            let _ = std::process::Command::new("notepad.exe").arg(&path).spawn();
-        }
-    });
+/// Battery (DC) screen-off, sleep and hibernate timeouts in minutes.
+fn read_timeouts() -> [Option<u32>; 3] {
+    [setting::DISPLAY_OFF_AFTER, setting::SLEEP_AFTER, setting::HIBERNATE_AFTER]
+        .map(|s| tweaks::read(s).ok().map(|(_, dc)| dc / 60))
 }

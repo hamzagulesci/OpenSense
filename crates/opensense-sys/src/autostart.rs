@@ -119,7 +119,10 @@ pub fn enable_for(exe: &std::path::Path) -> Result<(), SysError> {
     for unit in xml.encode_utf16() {
         bytes.extend_from_slice(&unit.to_le_bytes());
     }
-    let path = std::env::temp_dir().join("opensense-task.xml");
+    // Not a fixed name: another process of the same user could otherwise
+    // prepare or swap the file this elevated process hands to schtasks.
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+    let path = std::env::temp_dir().join(format!("opensense-task-{}-{nonce:08x}.xml", std::process::id()));
     std::fs::write(&path, bytes)?;
     let out = schtasks(&["/Create", "/F", "/TN", TASK_NAME, "/XML", &path.display().to_string()]);
     let _ = std::fs::remove_file(&path);

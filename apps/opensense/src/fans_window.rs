@@ -154,6 +154,11 @@ impl FansWindow {
         self.drag.is_some()
     }
 
+    /// Fans are at Max for a calibration run.
+    pub fn calibrating(&self) -> bool {
+        self.calibration.is_some()
+    }
+
     // ---- left column ------------------------------------------------------------
 
     fn left_column(&mut self, ui: &mut egui::Ui, cfg: &mut AppConfig, lang: Lang) -> bool {
@@ -275,7 +280,9 @@ impl FansWindow {
             let v = v as u32;
             let new = (v < crate::nvidia::CLOCK_MAX).then_some(v);
             modes::profile_mut(cfg, &key).gpu_clock_limit = new;
-            std::thread::spawn(move || crate::nvidia::apply_clock_limit(new));
+            // Forced: the tray agent may have set the lock this window knows
+            // nothing about.
+            std::thread::spawn(move || crate::nvidia::set_clock_limit(new, true));
             changed = true;
         }
         if max > 0 {
@@ -302,6 +309,9 @@ impl FansWindow {
             p.fore,
         );
         let custom = modes::is_custom(&self.key);
+        // Before the name field runs: clicking "Done" also takes the focus
+        // from it, which already ends the rename this frame.
+        let was_renaming = self.renaming;
         // Mode selector (or the name field while renaming) and "+".
         let sel = Rect::from_min_max(Pos2::new(row.right() - 210.0, row.top() + 2.0), row.max - Vec2::new(0.0, 4.0));
         let w = sel.width();
@@ -368,7 +378,7 @@ impl FansWindow {
             );
             let label = if self.renaming { t("Done") } else { t("Rename") };
             if ui::row_button(ui, rename, "rename-mode", label, None, true).clicked() {
-                self.renaming = !self.renaming;
+                self.renaming = !was_renaming;
             }
             if ui::row_button(ui, del, "remove-mode", t("Delete"), None, true).clicked() {
                 self.renaming = false;
@@ -644,7 +654,7 @@ impl FansWindow {
             Some(m) => modes::approx_rpm(p) as f32 * f32::from(m) / modes::approx_rpm(100) as f32,
             None => modes::approx_rpm(p) as f32,
         };
-        format!("{}", (rpm / 200.0).floor() as u32 * 200)
+        format!("{}", (rpm / 100.0).round() as u32 * 100)
     }
 
     /// Calibration: fans at Max, sample every second, stop after 15 s with
@@ -753,6 +763,7 @@ pub struct FansApp {
     modified: Option<std::time::SystemTime>,
     checked: Instant,
     marked: bool,
+    close_pending: bool,
     /// Closes the window when the user switches to another app.
     away: crate::tray::AwayWatch,
 }
@@ -780,6 +791,7 @@ impl FansApp {
             modified: config_mtime(),
             checked: Instant::now(),
             marked: false,
+            close_pending: false,
             away: crate::tray::AwayWatch::default(),
         }
     }
@@ -795,6 +807,7 @@ impl eframe::App for FansApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        crate::tray::keep_tray_only();
         if !self.marked {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.window.title.clone()));
             if let Some(hwnd) = crate::tray::find_own_window(&self.window.title) {
@@ -804,11 +817,17 @@ impl eframe::App for FansApp {
                 self.marked = true;
             }
         }
+        // A calibration has the fans at Max: the window stays until it has
+        // finished and handed them back.
+        let busy = self.window.calibrating();
+        crate::panel::hold_close(ctx, busy, &mut self.close_pending);
         // Like a flyout: switching to another app closes the window.
-        if self.away.gone(ctx) && !self.cfg.topmost {
+        if busy {
+            self.away.reset();
+        } else if self.away.gone(ctx) && !self.cfg.topmost {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !busy {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         // Follow changes made by the main window or the tray menu.
@@ -821,14 +840,7 @@ impl eframe::App for FansApp {
                 self.lang = Lang::resolve(&self.cfg.language);
             }
             // Theme from the settings or, on "Windows", the system.
-            let dark = theme::is_dark(&self.cfg.ui_mode);
-            if dark != self.dark {
-                self.dark = dark;
-                theme::apply(ctx, dark);
-                if let Some((hwnd, _)) = crate::tray::find_marked_window(MARK_PROP) {
-                    theme::title_bar_of(hwnd, dark);
-                }
-            }
+            theme::follow(ctx, &self.cfg.ui_mode, &mut self.dark, MARK_PROP);
         }
         if self.window.show(ctx, &mut self.cfg, self.lang, &self.worker) {
             if let Err(e) = self.cfg.save() {

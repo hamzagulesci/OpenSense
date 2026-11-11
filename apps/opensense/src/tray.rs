@@ -164,7 +164,39 @@ impl AwayWatch {
 /// Keeps a window out of the taskbar and Alt+Tab, so it lives only in the
 /// tray: Windows lists neither for a window that has an owner and no
 /// WS_EX_APPWINDOW. The owner is a hidden window of this process.
+/// The window this process keeps tray-only (each window is its own
+/// process, so one is enough).
+static TRAY_ONLY_WINDOW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// Re-applies [`tray_only`] if the windowing library put WS_EX_APPWINDOW
+/// back (it does when it shows the window), which would bring the taskbar
+/// and Alt+Tab entry back. One style read per call; call it every frame.
+pub fn keep_tray_only() {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, IsWindowVisible, SetWindowLongPtrW, ShowWindow, GWL_EXSTYLE, SW_HIDE, SW_SHOWNA,
+        WS_EX_APPWINDOW,
+    };
+    let raw = TRAY_ONLY_WINDOW.load(std::sync::atomic::Ordering::Relaxed);
+    if raw == 0 {
+        return;
+    }
+    let hwnd = HWND(raw as *mut core::ffi::c_void);
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        if ex & WS_EX_APPWINDOW.0 as isize == 0 {
+            return;
+        }
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & !(WS_EX_APPWINDOW.0 as isize));
+        // The taskbar only re-reads the style when the window is shown.
+        if IsWindowVisible(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            let _ = ShowWindow(hwnd, SW_SHOWNA);
+        }
+    }
+}
+
 pub fn tray_only(hwnd: HWND) {
+    TRAY_ONLY_WINDOW.store(hwnd.0 as isize, std::sync::atomic::Ordering::Relaxed);
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWLP_HWNDPARENT, GWL_EXSTYLE,
         SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WINDOW_EX_STYLE, WS_EX_APPWINDOW,
@@ -217,11 +249,14 @@ fn close_idle_main_window() {
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::System::SystemInformation::GetTickCount;
     use windows::Win32::UI::WindowsAndMessaging::{IsWindowVisible, PostMessageW, WM_CLOSE};
-    if let Some((hwnd, lost)) = find_main_window() {
-        let hidden = !unsafe { IsWindowVisible(hwnd) }.as_bool();
-        let idle = lost > 1 && (unsafe { GetTickCount() } as usize).wrapping_sub(lost) > 5 * 60 * 1000;
-        if hidden && idle {
-            let _ = unsafe { PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) };
+    // The window property holds the tick count when the window was hidden.
+    for prop in [crate::panel::MARK_PROP, crate::diag_window::MARK_PROP] {
+        if let Some((hwnd, lost)) = find_marked_window(prop) {
+            let hidden = !unsafe { IsWindowVisible(hwnd) }.as_bool();
+            let idle = lost > 1 && (unsafe { GetTickCount() } as usize).wrapping_sub(lost) > 5 * 60 * 1000;
+            if hidden && idle {
+                let _ = unsafe { PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) };
+            }
         }
     }
 }
@@ -514,6 +549,9 @@ fn charge_tick(cfg: &mut AppConfig, worker: &worker::WorkerHandle, cap: Option<b
     }
 }
 
+/// Mode key and stored CPU / GPU curves.
+type FanSource = (String, Vec<[u8; 2]>, Vec<[u8; 2]>);
+
 type MenuState = (String, Vec<String>, Option<GpuMode>, (bool, bool, bool), Lang, bool);
 
 /// Starts or stops the overlay to match the settings.
@@ -586,6 +624,12 @@ pub fn run(kind: TransportKind) {
     let mut game_only = cfg.overlay_game_only;
     let mut fan_loop = crate::modes::FanLoop::default();
     let mut restart_after: Option<std::time::Instant> = None;
+    // Answer of the GPU mode question, asked on its own thread: a modal box
+    // on this thread would stop the fan curve while it is open.
+    let (gpu_tx, gpu_rx) = std::sync::mpsc::channel::<(GpuMode, bool, bool)>();
+    let mut gpu_asking = false;
+    // Mode and curves the fan loop last ran with.
+    let mut fan_source: Option<FanSource> = None;
     // Firmware mode seen on consecutive ticks, and when OpenSense last
     // switched modes itself (the firmware may still report the old one).
     let mut seen_mode: (Option<opensense_proto::mode::OperationMode>, u32) = (None, 0);
@@ -685,6 +729,16 @@ pub fn run(kind: TransportKind) {
             // Software fan curve of the current mode.
             let key = crate::modes::current_key(&cfg);
             let profile = crate::modes::profile(&cfg, &key);
+            // Another mode or an edited curve: start over, otherwise the
+            // hysteresis would hold the old (higher) speed until the
+            // temperature drops.
+            let source = (key.clone(), profile.cpu_curve.clone(), profile.gpu_curve.clone());
+            if fan_source.as_ref() != Some(&source) {
+                if fan_source.is_some() && profile.apply_curve {
+                    fan_loop.restart();
+                }
+                fan_source = Some(source);
+            }
             if profile.apply_curve {
                 let c = crate::modes::from_stored(&profile.cpu_curve);
                 let g = crate::modes::from_stored(&profile.gpu_curve);
@@ -756,6 +810,15 @@ pub fn run(kind: TransportKind) {
                 menu_state = state;
             }
         }
+        while let Ok((m, switch, restart)) = gpu_rx.try_recv() {
+            gpu_asking = false;
+            if switch {
+                crate::apply::begin_gpu_write(&worker, m);
+                if restart {
+                    restart_after = Some(std::time::Instant::now());
+                }
+            }
+        }
         while let Ok(e) = TrayIconEvent::receiver().try_recv() {
             if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
                 toggle_window(mock);
@@ -776,12 +839,13 @@ pub fn run(kind: TransportKind) {
                 }
                 Action::Gpu(m) => {
                     let m = *m;
-                    let (switch, restart) = confirm_gpu(lang, m);
-                    if switch {
-                        crate::apply::begin_gpu_write(&worker, m);
-                        if restart {
-                            restart_after = Some(std::time::Instant::now());
-                        }
+                    if !gpu_asking {
+                        gpu_asking = true;
+                        let tx = gpu_tx.clone();
+                        std::thread::spawn(move || {
+                            let (switch, restart) = confirm_gpu(lang, m);
+                            let _ = tx.send((m, switch, restart));
+                        });
                     }
                     menu_state.0.clear();
                 }
@@ -810,6 +874,8 @@ pub fn run(kind: TransportKind) {
         }
     }
     drop(overlay);
+    auto.stop(&cfg);
+    crate::nvidia::release_clock_limit();
     // The guard restores the fans synchronously when it is dropped below.
     guard.restore = fan_loop.active().then(|| cfg.fan.clone());
     unsafe {

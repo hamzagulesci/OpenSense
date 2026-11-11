@@ -85,6 +85,7 @@ pub struct Automation {
     last_key: Option<String>,
     /// Lid action currently forced to "do nothing".
     clamshell_active: bool,
+    clamshell_checked: bool,
     ticks: u32,
 }
 
@@ -97,6 +98,7 @@ impl Automation {
             last_ac: None,
             last_key: None,
             clamshell_active: false,
+            clamshell_checked: false,
             ticks: 0,
         }
     }
@@ -216,7 +218,10 @@ impl Automation {
         self.osd.tick();
         self.ticks += 1;
         let mut changed = false;
-        let on_ac = worker.shared.lock().power.on_ac;
+        // Asked from Windows directly: the worker's snapshot reads "on
+        // battery" until its first poll, which would look like a power
+        // source change (and store the AC mode as the battery mode).
+        let Ok(on_ac) = opensense_sys::power::status().map(|p| p.on_ac) else { return false };
         let key = crate::modes::current_key(cfg);
 
         // Remember the mode per power source; restore it when the source
@@ -267,6 +272,13 @@ impl Automation {
         // Clamshell: lid closes without sleep while plugged in with an
         // external display (checked every 2 s).
         if self.ticks.is_multiple_of(2) {
+            // A previous run that was killed may have left the lid action
+            // forced to "do nothing"; pick that up so it gets restored.
+            if !self.clamshell_checked {
+                self.clamshell_checked = true;
+                self.clamshell_active =
+                    cfg.clamshell_default_lid.is_some() && tweaks::read(setting::LID_ACTION).is_ok_and(|v| v.0 == 0);
+            }
             let want = cfg.clamshell && on_ac && tweaks::monitor_count() > 1;
             if want != self.clamshell_active {
                 if want {
@@ -283,6 +295,14 @@ impl Automation {
             }
         }
         changed
+    }
+
+    /// On exit: gives the lid action back if clamshell mode forced it.
+    pub fn stop(&mut self, cfg: &AppConfig) {
+        if self.clamshell_active {
+            let _ = tweaks::write(setting::LID_ACTION, Some(cfg.clamshell_default_lid.unwrap_or(1)), None);
+            self.clamshell_active = false;
+        }
     }
 }
 

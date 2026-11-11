@@ -147,12 +147,17 @@ impl FpsMonitor {
             return None;
         }
         // ProcessTrace blocks until the session is closed.
-        std::thread::Builder::new()
-            .name("opensense-fps".into())
-            .spawn(move || {
-                let _ = unsafe { ProcessTrace(&[trace], None, None) };
-            })
-            .ok()?;
+        let spawned = std::thread::Builder::new().name("opensense-fps".into()).spawn(move || {
+            let _ = unsafe { ProcessTrace(&[trace], None, None) };
+        });
+        if spawned.is_err() {
+            // Do not leave the session running without a reader.
+            unsafe {
+                let _ = ControlTraceW(control, PCWSTR::null(), props.as_mut_ptr().cast(), EVENT_TRACE_CONTROL_STOP);
+                let _ = CloseTrace(trace);
+            }
+            return None;
+        }
         // Flush often so frames arrive promptly instead of once a second.
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let (flag, control_value) = (stop.clone(), control.Value);
@@ -160,6 +165,10 @@ impl FpsMonitor {
             let mut p = properties();
             while !flag.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(250));
+                // Stopped while asleep: the handle is closed by now.
+                if flag.load(Ordering::Relaxed) {
+                    break;
+                }
                 let _ = unsafe {
                     ControlTraceW(
                         CONTROLTRACE_HANDLE { Value: control_value },

@@ -34,10 +34,14 @@ mod imp {
     pub fn status() -> Result<PowerStatus, SysError> {
         let mut s = SYSTEM_POWER_STATUS::default();
         unsafe { GetSystemPowerStatus(&mut s)? };
+        // 255 = unknown: report that rather than "on battery".
+        if s.ACLineStatus > 1 {
+            return Err(SysError::Win("AC line status unknown".into()));
+        }
         Ok(PowerStatus {
             on_ac: s.ACLineStatus == 1,
             battery_percent: (s.BatteryLifePercent <= 100).then_some(s.BatteryLifePercent),
-            charging: s.BatteryFlag & 8 != 0,
+            charging: s.BatteryFlag != 255 && s.BatteryFlag & 8 != 0,
         })
     }
 
@@ -173,8 +177,8 @@ mod modes {
     use windows::core::GUID;
     use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
     use windows::Win32::System::Power::{
-        PowerEnumerate, PowerGetActiveScheme, PowerReadACValueIndex, PowerSetActiveScheme, PowerWriteACValueIndex,
-        PowerWriteDCValueIndex, ACCESS_SCHEME,
+        PowerEnumerate, PowerGetActiveScheme, PowerReadACValueIndex, PowerReadDCValueIndex, PowerSetActiveScheme,
+        PowerWriteACValueIndex, PowerWriteDCValueIndex, ACCESS_SCHEME,
     };
 
     const OVERLAY_EFFICIENCY: GUID = GUID::from_u128(0x961cc777_2547_4f9d_8174_7d86181b8a7a);
@@ -333,10 +337,18 @@ mod modes {
 
     pub fn set_cpu_boost(v: u8) -> Result<(), SysError> {
         let scheme = active().ok_or_else(|| SysError::Win("no active power plan".into()))?;
-        if cpu_boost() == Some(v) {
+        let v = u32::from(v.min(6));
+        // Both the plugged-in and the battery value must already match.
+        let (mut ac, mut dc) = (u32::MAX, u32::MAX);
+        let same = unsafe {
+            PowerReadACValueIndex(None, Some(&scheme), Some(&SUB_PROCESSOR), Some(&BOOST_MODE), &mut ac)
+                == ERROR_SUCCESS
+                && PowerReadDCValueIndex(None, Some(&scheme), Some(&SUB_PROCESSOR), Some(&BOOST_MODE), &mut dc) == 0
+        } && ac == v
+            && dc == v;
+        if same {
             return Ok(());
         }
-        let v = u32::from(v.min(6));
         unsafe {
             check(PowerWriteACValueIndex(None, &scheme, Some(&SUB_PROCESSOR), Some(&BOOST_MODE), v).0, "write AC")?;
             check(PowerWriteDCValueIndex(None, &scheme, Some(&SUB_PROCESSOR), Some(&BOOST_MODE), v), "write DC")?;

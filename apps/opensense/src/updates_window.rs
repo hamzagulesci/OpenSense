@@ -42,6 +42,10 @@ pub struct UpdatesApp {
     bios: Option<(String, String)>,
     nvidia: Arc<Mutex<Option<String>>>,
     model: String,
+    /// Settings file time, to follow theme / language changes.
+    modified: Option<std::time::SystemTime>,
+    checked: std::time::Instant,
+    close_pending: bool,
 }
 
 impl UpdatesApp {
@@ -61,6 +65,8 @@ impl UpdatesApp {
                 cfg.latest_version = Some(r.version);
                 cfg.update_checked = Some(updates::now_secs());
                 let _ = cfg.save();
+                // Otherwise the tray's next save writes its older copy back.
+                crate::tray::notify_config_changed();
             }
             *n.lock().unwrap() = updates::nvidia_driver();
             ctx.request_repaint();
@@ -77,6 +83,9 @@ impl UpdatesApp {
                 .model
                 .map(|m| crate::panel::model_title(&m))
                 .unwrap_or_default(),
+            modified: crate::fans_window::config_mtime(),
+            checked: std::time::Instant::now(),
+            close_pending: false,
         }
     }
 
@@ -91,6 +100,7 @@ impl eframe::App for UpdatesApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        crate::tray::keep_tray_only();
         if !self.marked {
             if let Some(hwnd) = crate::tray::find_own_window(tr(self.lang, "Updates")) {
                 crate::panel::set_prop(hwnd, MARK_PROP, 1);
@@ -103,7 +113,23 @@ impl eframe::App for UpdatesApp {
         if self.away.gone(ctx) && !matches!(*self.state.lock().unwrap(), State::Installing) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if self.checked.elapsed() > Duration::from_millis(200) {
+            self.checked = std::time::Instant::now();
+            let m = crate::fans_window::config_mtime();
+            if m != self.modified {
+                self.modified = m;
+                let cfg = AppConfig::load();
+                self.lang = Lang::resolve(&cfg.language);
+                theme::follow(ctx, &cfg.ui_mode, &mut self.dark, MARK_PROP);
+            } else if self.dark != theme::is_dark(&AppConfig::load().ui_mode) {
+                // "Windows" theme: the system setting changed.
+                theme::follow(ctx, &AppConfig::load().ui_mode, &mut self.dark, MARK_PROP);
+            }
+        }
+        // Closing while files are being replaced could leave no executable.
+        let installing = matches!(*self.state.lock().unwrap(), State::Installing);
+        crate::panel::hold_close(ctx, installing, &mut self.close_pending);
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !installing {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         egui::CentralPanel::default().frame(egui::Frame::none().fill(pal().form).inner_margin(5.0)).show(ctx, |ui| {
@@ -112,7 +138,7 @@ impl eframe::App for UpdatesApp {
             ui.add_space(10.0);
             self.drivers_section(ui);
         });
-        ctx.request_repaint_after(Duration::from_millis(500));
+        ctx.request_repaint_after(Duration::from_millis(250));
     }
 }
 
@@ -183,11 +209,18 @@ impl UpdatesApp {
                     theme::ECO,
                 );
                 if ui::row_button(ui, button, "restart", self.t("Restart OpenSense"), None, false).clicked() {
-                    crate::tray::request_quit();
-                    std::thread::sleep(Duration::from_millis(600));
-                    crate::tray::spawn_detached(&[]);
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    // Old windows and tray first, then the new version: started
+                    // earlier it would find them and exit again.
                     crate::panel::close_main_window();
+                    crate::tray::request_quit();
+                    for _ in 0..50 {
+                        if !crate::tray::is_running() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    crate::tray::spawn_detached(&["--relaunched"]);
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
             State::Failed(e) => {

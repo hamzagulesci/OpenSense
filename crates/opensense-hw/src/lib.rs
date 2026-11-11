@@ -8,6 +8,7 @@
 use opensense_proto::GamingMethod;
 
 pub mod device;
+pub mod diag;
 pub mod mock;
 #[cfg(windows)]
 pub mod wmi;

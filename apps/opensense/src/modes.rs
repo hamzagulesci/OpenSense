@@ -314,6 +314,12 @@ impl FanLoop {
         self.last_write.is_some()
     }
 
+    /// Forgets the chosen speeds so the next step writes what the (new)
+    /// curves ask for, also when that is slower. Stays "active".
+    pub fn restart(&mut self) {
+        self.state = [None, None];
+    }
+
     /// Next fan speeds, or `None` when nothing needs to be written. A fan
     /// whose own temperature is missing follows the other one; with none
     /// for [`MISSING_LIMIT`] ticks the loop gives the fans back to the
@@ -461,5 +467,21 @@ mod tests {
         let c = from_stored(&stored).unwrap();
         assert!(c[7][1] >= safety_min(100.0));
         assert_eq!(c[0][1], 0.0);
+    }
+
+    #[test]
+    fn fan_loop_restart_applies_a_lower_curve_at_once() {
+        let (high, low) = (flat(60.0), flat(20.0));
+        let mut l = FanLoop::default();
+        let t0 = Instant::now();
+        l.step([&high, &high], [Some(70), Some(70)], t0);
+        // Same temperature, lower curve: hysteresis alone keeps the old speed.
+        assert_eq!(l.step([&low, &low], [Some(70), Some(70)], t0), None);
+        l.restart();
+        assert!(l.active());
+        assert_eq!(
+            l.step([&low, &low], [Some(70), Some(70)], t0),
+            Some(FanStep::Custom(CustomFan { cpu_percent: Some(20), gpu_percent: Some(20) }))
+        );
     }
 }

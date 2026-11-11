@@ -23,6 +23,8 @@ struct MockState {
     settings: HashMap<(GamingMethod, u8), u64>,
     log: Vec<(GamingMethod, u64)>,
     charge_limit: bool,
+    /// Writes made through `call_raw` (battery control).
+    raw_writes: usize,
 }
 
 impl Default for MockTransport {
@@ -35,6 +37,11 @@ impl Default for MockTransport {
 }
 
 impl MockTransport {
+    /// Number of writes made through `call_raw` (battery control).
+    pub fn raw_writes(&self) -> usize {
+        self.state.lock().raw_writes
+    }
+
     /// Every Set call made so far, oldest first.
     pub fn calls(&self) -> Vec<(GamingMethod, u64)> {
         self.state.lock().log.clone()
@@ -124,6 +131,7 @@ impl GamingTransport for MockTransport {
         if method == battery::SET_CONTROL {
             let on = inputs.iter().find(|(n, _)| *n == "uFunctionStatus").and_then(|(_, v)| v.as_int()) == Some(1);
             st.charge_limit = on;
+            st.raw_writes += 1;
             return Ok(vec![WmiValue::Int(0)]);
         }
         Ok(vec![WmiValue::Int(3), WmiValue::Bytes(vec![u8::from(st.charge_limit), 0, 0, 0, 0])])

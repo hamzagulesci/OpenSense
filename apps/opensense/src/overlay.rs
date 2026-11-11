@@ -27,8 +27,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetForegroundWindow, GetWindowLongW, GetWindowRect,
     GetWindowThreadProcessId, KillTimer, RegisterClassW, SetTimer, SetWindowLongW, SetWindowPos, ShowWindow,
     UpdateLayeredWindow, GWL_EXSTYLE, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
-    SW_SHOWNOACTIVATE, ULW_ALPHA, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_TIMER,
-    WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    SW_SHOWNOACTIVATE, ULW_ALPHA, WM_CAPTURECHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use crate::fps::FpsMonitor;
@@ -185,10 +186,22 @@ fn set_click_through(hwnd: HWND, on: bool) {
     }
 }
 
+/// What a mouse message asks of the window, done after the state lock is
+/// released: these calls send messages back to this window procedure, which
+/// would deadlock on the lock.
+enum After {
+    Nothing,
+    ClickThrough(bool),
+    Capture,
+    Move(i32, i32),
+    Release { click_through: bool },
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    let Ok(mut m) = MOUSE.lock() else { return unsafe { DefWindowProcW(hwnd, msg, wp, lp) } };
-    match msg {
+    let Ok(mut m) = MOUSE.try_lock() else { return unsafe { DefWindowProcW(hwnd, msg, wp, lp) } };
+    let after = match msg {
         WM_TIMER if wp.0 == DRAG_TIMER => {
+            let mut after = After::Nothing;
             if !m.dragging {
                 let r = window_rect(hwnd);
                 let (x, y) = cursor();
@@ -196,10 +209,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let grab = over && keys_held();
                 if grab != m.grab {
                     m.grab = grab;
-                    set_click_through(hwnd, !grab);
+                    after = After::ClickThrough(!grab);
                 }
             }
-            LRESULT(0)
+            after
         }
         WM_LBUTTONDOWN if m.grab => {
             let r = window_rect(hwnd);
@@ -207,8 +220,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             m.moved = false;
             m.start_cursor = cursor();
             m.start_window = (r.left, r.top);
-            unsafe { SetCapture(hwnd) };
-            LRESULT(0)
+            After::Capture
         }
         WM_MOUSEMOVE if m.dragging => {
             let (x, y) = cursor();
@@ -222,38 +234,63 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let area = monitor_area(x, y);
                 let nx = (m.start_window.0 + dx).clamp(area.left + 5, (area.right - w - 5).max(area.left + 5));
                 let ny = (m.start_window.1 + dy).clamp(area.top + 5, (area.bottom - h - 5).max(area.top + 5));
-                let _ = unsafe { SetWindowPos(hwnd, None, nx, ny, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) };
+                After::Move(nx, ny)
+            } else {
+                After::Nothing
             }
-            LRESULT(0)
         }
         WM_LBUTTONUP if m.dragging => {
-            let _ = unsafe { ReleaseCapture() };
             m.dragging = false;
             if m.moved {
                 m.released_after_move = true;
             } else {
                 m.clicked = true;
             }
-            if !keys_held() {
+            let held = keys_held();
+            if !held {
                 m.grab = false;
-                set_click_through(hwnd, true);
             }
-            LRESULT(0)
+            After::Release { click_through: !held }
+        }
+        // Capture taken away mid-drag (UAC prompt, focus change): the button
+        // release never arrives, so end the drag here.
+        WM_CAPTURECHANGED if m.dragging => {
+            m.dragging = false;
+            m.grab = false;
+            After::ClickThrough(true)
         }
         WM_MOUSEWHEEL if m.grab => {
             let delta = ((wp.0 >> 16) & 0xFFFF) as u16 as i16;
             m.wheel += if delta > 0 { 1 } else { -1 };
-            LRESULT(0)
+            After::Nothing
         }
         WM_MBUTTONDOWN if m.grab => {
             m.reset_scale = true;
-            LRESULT(0)
+            After::Nothing
         }
         _ => {
             drop(m);
-            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+            return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+        }
+    };
+    drop(m);
+    match after {
+        After::Nothing => {}
+        After::ClickThrough(on) => set_click_through(hwnd, on),
+        After::Capture => {
+            unsafe { SetCapture(hwnd) };
+        }
+        After::Move(x, y) => {
+            let _ = unsafe { SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) };
+        }
+        After::Release { click_through } => {
+            let _ = unsafe { ReleaseCapture() };
+            if click_through {
+                set_click_through(hwnd, true);
+            }
         }
     }
+    LRESULT(0)
 }
 
 /// Bounds of the monitor containing a point.
@@ -313,6 +350,15 @@ pub struct Overlay {
 
 impl Overlay {
     pub fn start(cfg: &AppConfig) -> Option<Self> {
+        // No drag or click left over from a previous overlay window.
+        if let Ok(mut m) = MOUSE.lock() {
+            m.grab = false;
+            m.dragging = false;
+            m.clicked = false;
+            m.released_after_move = false;
+            m.wheel = 0;
+            m.reset_scale = false;
+        }
         let hwnd = unsafe {
             let instance = GetModuleHandleW(None).ok()?;
             let class = WNDCLASSW {
@@ -353,7 +399,15 @@ impl Overlay {
             fps_value: 0.0,
         };
         // Initial position: saved, else top-left of the primary monitor.
-        let (x, y) = cfg.overlay_pos.map_or((10, 10), |p| (p[0], p[1]));
+        // A position saved on a monitor that is gone is pulled back onto the
+        // nearest one, where the overlay can be reached.
+        let (x, y) = cfg.overlay_pos.map_or((10, 10), |p| {
+            let area = monitor_area(p[0], p[1]);
+            (
+                p[0].clamp(area.left, (area.right - 40).max(area.left)),
+                p[1].clamp(area.top, (area.bottom - 40).max(area.top)),
+            )
+        });
         unsafe {
             let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
         }
@@ -439,7 +493,9 @@ impl Overlay {
 
     fn paint(&self, cfg: &AppConfig, m: &Metrics, cpu_load: f32, gpu_load: Option<f32>, ram: Option<(f32, u32)>) {
         // Base scale 2.0 at 100 %, independent of the display scale.
-        let sc = 2.0 * f32::from(cfg.overlay_scale) / 100.0;
+        // Clamped here too: a hand-edited 0 would make the overlay invisible
+        // and a huge value overflow the bitmap size.
+        let sc = 2.0 * f32::from(cfg.overlay_scale.clamp(35, 300)) / 100.0;
         let px = |v: f32| (v * sc).floor() as i32;
         let (line_h, gap, pad_y, pad_x, col_gap) = (px(18.0), px(1.0), px(4.0), px(8.0), px(8.0));
         let inner_h = 2 * line_h + gap;

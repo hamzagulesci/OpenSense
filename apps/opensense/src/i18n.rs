@@ -279,7 +279,10 @@ pub fn tr(lang: Lang, s: &'static str) -> &'static str {
         "Keep app window always on top" => "Uygulama penceresini her zaman üstte tut",
         "Auto Toggle Clamshell Mode" => "Kapak kapalı modunu otomatik aç/kapat",
         "Show on-screen notifications" => "Ekran bildirimlerini göster",
-        "Time to hibernate in sleep on battery" => "Pilde uykudan hazırda beklemeye geçiş",
+        "Time to hibernate in sleep on battery" => "Uykudan hazırda beklemeye geç",
+        "Turn off my screen after" => "Ekranı kapat",
+        "Put my device to sleep after" => "Uykuya geç",
+        "Never" => "Hiçbir zaman",
         "Acer Services Running" => "Çalışan Acer servisleri",
         "Stop" => "Durdur",
         "Start" => "Başlat",
@@ -375,6 +378,75 @@ pub fn tr(lang: Lang, s: &'static str) -> &'static str {
         "More" => "Diğer",
         "Static" => "Sabit",
         "Extra Settings" => "Ek Ayarlar",
+        "CPU Boost" => "CPU Boost",
+        // hardware test
+        "Hardware Test" => "Donanım Testi",
+        "Check which features work on this laptop and create a compatibility report" => {
+            "Bu dizüstünde hangi özelliklerin çalıştığını denetleyin ve uyumluluk raporu oluşturun"
+        }
+        "Device" => "Cihaz",
+        "Detecting…" => "Algılanıyor…",
+        "Automatic tests (read only)" => "Otomatik testler (salt okunur)",
+        "Tests that change hardware (ask first)" => "Donanımı değiştiren testler (önce sorulur)",
+        "Need a restart (not run)" => "Yeniden başlatma gerektirenler (çalıştırılmaz)",
+        "Running…" => "Çalışıyor…",
+        "Verified" => "Doğrulandı",
+        "Detected" => "Algılandı",
+        "Failed" => "Başarısız",
+        "Not run" => "Çalıştırılmadı",
+        "Run" => "Çalıştır",
+        "Run test" => "Testi çalıştır",
+        "CPU temperature" => "CPU sıcaklığı",
+        "GPU temperature" => "GPU sıcaklığı",
+        "CPU fan speed" => "CPU fan hızı",
+        "GPU fan speed" => "GPU fan hızı",
+        "Performance modes" => "Performans modları",
+        "Battery charge limit" => "Pil şarj sınırı",
+        "CoolBoost" => "CoolBoost",
+        "Screen overdrive" => "Ekran overdrive",
+        "Keyboard light timeout" => "Klavye ışığı zaman aşımı",
+        "GPU mode (MUX)" => "GPU modu (MUX)",
+        "Firmware values" => "Firmware değerleri",
+        "Switch performance mode" => "Performans modu değiştirme",
+        "Keyboard colours" => "Klavye renkleri",
+        "Change charge limit" => "Şarj sınırını değiştirme",
+        "Switch GPU mode" => "GPU modu değiştirme",
+        "Change screen overdrive" => "Ekran overdrive değiştirme",
+        "The fans run at full speed for up to 10 seconds, then return to automatic." => {
+            "Fanlar en fazla 10 saniye tam hızda döner, sonra otomatiğe döner."
+        }
+        "Switches to another performance mode for a moment, then back." => {
+            "Kısa süreliğine başka bir performans moduna geçer, sonra geri döner."
+        }
+        "The keyboard turns red for 2 seconds, then your colours return." => {
+            "Klavye 2 saniye kırmızı olur, sonra kendi renkleriniz geri gelir."
+        }
+        "Turns the 80% charge limit on or off for a moment, then back." => {
+            "%80 şarj sınırını kısa süreliğine açar ya da kapatır, sonra geri alır."
+        }
+        "Needs a restart, so it is not run here." => "Yeniden başlatma gerektirdiği için burada çalıştırılmaz.",
+        "Compatibility report" => "Uyumluluk raporu",
+        "Only the values above. No serial numbers, user names or files." => {
+            "Yalnızca yukarıdaki değerler. Seri numarası, kullanıcı adı ya da dosya yok."
+        }
+        "Show report" => "Raporu göster",
+        "Hide report" => "Raporu gizle",
+        "Save JSON" => "JSON kaydet",
+        "Copy" => "Kopyala",
+        "Share on GitHub" => "GitHub'da paylaş",
+        "Opens a pre-filled issue in your browser. Nothing is sent until you submit it there." => {
+            "Tarayıcınızda doldurulmuş bir issue açar. Siz orada gönderene kadar hiçbir şey gönderilmez."
+        }
+        "Report saved." => "Rapor kaydedildi.",
+        "Report copied." => "Rapor kopyalandı.",
+        "Run all tests" => "Tüm testleri çalıştır",
+        "All tests run one after another (about 25 seconds):" => "Tüm testler sırayla çalışır (yaklaşık 25 saniye):",
+        "supported; not run, needs a restart" => "destekleniyor; yeniden başlatma gerektirdiği için çalıştırılmadı",
+        "toggled and restored" => "değiştirildi ve geri alındı",
+        "firmware accepted the colours" => "firmware renkleri kabul etti",
+        "80% limit on" => "%80 sınırı açık",
+        "80% limit off" => "%80 sınırı kapalı",
+        "not run: needs a restart" => "çalıştırılmadı: yeniden başlatma gerekir",
         "Rename" => "Yeniden adlandır",
         "Done" => "Tamam",
         "Shift + Volume Down" => "Shift + Ses kısma",

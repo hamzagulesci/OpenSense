@@ -41,6 +41,7 @@ built to use as few resources as possible.
 | **Shortcuts** | Ctrl+Shift+F5 next mode, Ctrl+Shift+F12 show/hide, Ctrl+Shift+Alt+1/2/3 Quiet/Default/Extreme, Shift+Volume backlight, Ctrl+Shift+Alt+O overlay; on-screen notification |
 | **Overlay** | In-game FPS, temperatures, fan speeds, load and memory, optionally only over games |
 | **Automation** | Mode remembered per power source (plugged / battery), clamshell mode, PCIe link power and Modern Standby network tweaks, hibernate timeout, vendor service control |
+| **Hardware Test** | Detects model, BIOS, CPU and GPU and checks which features work: read-only tests run automatically, tests that change hardware run only after you confirm and always restore the previous state. Builds a compatibility report (JSON) with no serial numbers or user names, to save, copy or share as a GitHub issue |
 | **App** | Follows the Windows theme (or dark / light); English and Turkish; tray menu; start with Windows; update check |
 | **CLI** | `opensense-cli` for scripting and automation |
 
@@ -200,6 +201,7 @@ az kaynak kullanacak şekilde tasarlanmıştır.
 | **Kısayollar** | Ctrl+Shift+F5 sonraki mod, Ctrl+Shift+F12 göster/gizle, Ctrl+Shift+Alt+1/2/3 Sessiz/Varsayılan/Ekstrem, Shift+Ses klavye ışığı, Ctrl+Shift+Alt+O overlay; ekran bildirimi |
 | **Overlay** | Oyun içinde FPS, sıcaklıklar, fan hızları, yük ve bellek; istenirse yalnız oyunlarda |
 | **Otomasyon** | Güç kaynağına göre hatırlanan mod (adaptör / pil), kapak kapalı modu, PCIe ve Modern Bekleme ağ ayarları, hazırda bekletme süresi, Acer servis kontrolü |
+| **Donanım Testi** | Model, BIOS, CPU ve GPU'yu algılar, hangi özelliklerin çalıştığını denetler: salt okunur testler otomatik çalışır, donanımı değiştiren testler yalnızca onayınızla çalışır ve önceki durumu her zaman geri yükler. Seri numarası ya da kullanıcı adı içermeyen bir uyumluluk raporu (JSON) oluşturur; kaydedebilir, kopyalayabilir ya da GitHub issue'su olarak paylaşabilirsiniz |
 | **Uygulama** | Windows temasını izler (ya da koyu / açık); Türkçe ve İngilizce; tepsi menüsü; Windows ile başlatma; güncelleme kontrolü |
 | **Komut satırı** | Betik ve otomasyon için `opensense-cli` |
 

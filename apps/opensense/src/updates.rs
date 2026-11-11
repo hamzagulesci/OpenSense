@@ -86,13 +86,20 @@ pub fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-/// Removes executables left over from the previous update.
+/// Removes executables left over from previous updates
+/// (`opensense.exe.old`, `opensense.exe.old.<n>`, same for the CLI).
 pub fn cleanup() {
-    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
-        for name in ["opensense.exe.old", "opensense-cli.exe.old"] {
-            let _ = std::fs::remove_file(dir.join(name));
+    let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) else { return };
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if name.starts_with("opensense") && name.contains(".exe.old") {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
+}
+
+fn nonce() -> u32 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos())
 }
 
 /// SHA-256 of a file as lowercase hex.
@@ -114,7 +121,8 @@ pub fn install(zip_url: &str, sha256: Option<&str>) -> Result<(), String> {
     let expected = sha256.ok_or("the release publishes no checksum for the download")?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let dir = exe.parent().ok_or("no folder")?.to_path_buf();
-    let work: PathBuf = std::env::temp_dir().join("opensense-update");
+    // Not a fixed name, so nothing can be prepared there in advance.
+    let work: PathBuf = std::env::temp_dir().join(format!("opensense-update-{}-{:08x}", std::process::id(), nonce()));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
     let zip = work.join("update.zip");
@@ -131,8 +139,10 @@ pub fn install(zip_url: &str, sha256: Option<&str>) -> Result<(), String> {
         return Err("the download is damaged or was altered (checksum mismatch)".into());
     }
     let unpacked = work.join("files");
+    // Single quotes in a path (a user folder like O'Brien) are doubled.
+    let quoted = |p: &Path| p.display().to_string().replace('\'', "''");
     let script =
-        format!("Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force", zip.display(), unpacked.display());
+        format!("Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force", quoted(&zip), quoted(&unpacked));
     let ok = hidden(Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", &script]))
         .status()
         .is_ok_and(|s| s.success());
@@ -150,8 +160,12 @@ pub fn install(zip_url: &str, sha256: Option<&str>) -> Result<(), String> {
     for name in ["opensense.exe", "opensense-cli.exe"] {
         let Some(src) = find(&unpacked, name) else { continue };
         let dst = dir.join(name);
-        let old = dir.join(format!("{name}.old"));
-        let _ = std::fs::remove_file(&old);
+        let mut old = dir.join(format!("{name}.old"));
+        // A backup from an update earlier in this run is still executing
+        // and cannot be removed: use another name.
+        if std::fs::remove_file(&old).is_err() && old.exists() {
+            old = dir.join(format!("{name}.old.{:08x}", nonce()));
+        }
         if dst.exists() {
             if let Err(e) = std::fs::rename(&dst, &old) {
                 rollback(&replaced);

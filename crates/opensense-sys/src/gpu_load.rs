@@ -36,13 +36,12 @@ fn query(luid: LUID, setup: impl FnOnce(&mut D3DKMT_QUERYSTATISTICS)) -> Option<
     status.is_ok().then_some(q)
 }
 
-fn node_running_time(luid: LUID, node: u32) -> i64 {
+fn node_running_time(luid: LUID, node: u32) -> Option<i64> {
     query(luid, |q| {
         q.Type = D3DKMT_QUERYSTATISTICS_NODE;
         q.Anonymous.QueryNode.NodeId = node;
     })
     .map(|q| unsafe { q.QueryResult.NodeInformation.GlobalInformation.RunningTime })
-    .unwrap_or(0)
 }
 
 impl GpuLoadMonitor {
@@ -66,7 +65,7 @@ impl GpuLoadMonitor {
                     .map(|q| q.QueryResult.AdapterInformation.NodeCount)
                     .unwrap_or(0);
                 if nodes > 0 {
-                    let last = (0..nodes).map(|n| node_running_time(info.AdapterLuid, n)).collect();
+                    let last = (0..nodes).map(|n| node_running_time(info.AdapterLuid, n).unwrap_or(0)).collect();
                     adapters.push(Adapter { luid: info.AdapterLuid, nodes, last });
                 }
             }
@@ -85,7 +84,9 @@ impl GpuLoadMonitor {
         let mut busiest = 0.0f64;
         for a in &mut self.adapters {
             for n in 0..a.nodes {
-                let t = node_running_time(a.luid, n);
+                // A failed query keeps the last value: storing 0 would turn
+                // the next good sample into a 100 % spike.
+                let Some(t) = node_running_time(a.luid, n) else { continue };
                 let delta = (t - a.last[n as usize]).max(0) as f64;
                 a.last[n as usize] = t;
                 busiest = busiest.max(delta / wall);

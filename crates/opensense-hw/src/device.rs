@@ -169,8 +169,15 @@ impl NitroDevice {
             M::SetGamingFanBehavior,
             fan::behavior_word(&[(FanGroup::Cpu, b(c.cpu_percent)), (FanGroup::Gpu, b(c.gpu_percent))]),
         )?;
-        self.set(M::SetGamingFanSpeed, fan::speed_word(FanGroup::Cpu, c.cpu_percent.unwrap_or(0)))?;
-        self.set(M::SetGamingFanSpeed, fan::speed_word(FanGroup::Gpu, c.gpu_percent.unwrap_or(0)))
+        let speeds = self
+            .set(M::SetGamingFanSpeed, fan::speed_word(FanGroup::Cpu, c.cpu_percent.unwrap_or(0)))
+            .and_then(|()| self.set(M::SetGamingFanSpeed, fan::speed_word(FanGroup::Gpu, c.gpu_percent.unwrap_or(0))));
+        if speeds.is_err() {
+            // Custom behaviour without a valid speed: do not leave the fans
+            // at whatever the firmware last held.
+            let _ = self.set_fans_auto();
+        }
+        speeds
     }
 
     pub fn coolboost(&self) -> Result<Option<bool>, HwError> {
@@ -212,12 +219,12 @@ impl NitroDevice {
 
     pub fn gpu_mode_supported(&self) -> Result<bool, HwError> {
         let r = self.get(M::GetGamingMiscSetting, mode::misc_get_word(mode::MISC_GPU_MODE_SUPPORT))?;
-        Ok((r >> 8) & 0xFF == 3)
+        Ok(mode::byte1_if_ok(r) == Some(3))
     }
 
     pub fn gpu_mode(&self) -> Result<Option<GpuMode>, HwError> {
         let r = self.get(M::GetGamingMiscSetting, mode::misc_get_word(mode::MISC_GPU_MODE))?;
-        Ok(GpuMode::from_u8(((r >> 8) & 0xFF) as u8))
+        Ok(mode::byte1_if_ok(r).and_then(GpuMode::from_u8))
     }
 
     /// Takes effect after a reboot.

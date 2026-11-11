@@ -1,5 +1,5 @@
 # Rust build output
-/target
+/target/
 *.pdb
 **/*.rs.bk
 
@@ -9,20 +9,38 @@
 /installer/opensense.ico
 /installer/Output/
 *.zip
+SHA256SUMS.txt
 
 # Third-party reference sources, not part of OpenSense
 /.references/
 /g-helper-main/
-/g-helper-0.291/
+/g-helper-*/
 
-# Logs and local test files
+# Files OpenSense writes at run time (settings backups, update leftovers,
+# hardware test reports)
+*.toml.bad
+*.toml.tmp
+*.toml.*.tmp
+*.exe.old
+*.exe.old.*
+opensense-report-*.json
+opensense-battery-report.html
+opensense-scan.txt
+
+# Logs and traces
 *.log
 *.etl
-opensense-battery-report.html
+
+# Scratch files
+*.bak
+*.orig
+*.rej
+*.tmp
 
 # Editors and IDEs
 .vscode/
 .idea/
+.vs/
 *.code-workspace
 *.swp
 *~
@@ -35,3 +53,7 @@ desktop.ini
 # Local tool state
 .claude/
 graphify-out/
+.graphify_*
+
+# Local notes (review findings that are still open)
+/KNOWN_ISSUES.md

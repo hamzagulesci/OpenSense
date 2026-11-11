@@ -196,6 +196,22 @@ pub fn title_bar(title: &str, dark: bool) {
     }
 }
 
+/// Switches a window to the theme `ui_mode` asks for ("dark", "light" or
+/// the Windows setting) when it differs from `dark`; returns true if it
+/// changed. `mark` is the window's property, to find its title bar.
+pub fn follow(ctx: &egui::Context, ui_mode: &str, dark: &mut bool, mark: &str) -> bool {
+    let want = is_dark(ui_mode);
+    if want == *dark {
+        return false;
+    }
+    *dark = want;
+    apply(ctx, want);
+    if let Some((hwnd, _)) = crate::tray::find_marked_window(mark) {
+        title_bar_of(hwnd, want);
+    }
+    true
+}
+
 /// Dark or light title bar for a window handle.
 pub fn title_bar_of(hwnd: windows::Win32::Foundation::HWND, dark: bool) {
     use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};

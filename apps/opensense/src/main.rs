@@ -2,6 +2,8 @@
 
 mod apply;
 mod automation;
+mod diag_report;
+mod diag_window;
 mod extra_window;
 mod fans_window;
 mod fps;
@@ -34,6 +36,8 @@ struct Args {
     extra: bool,
     /// Updates window (`--updates`).
     updates: bool,
+    /// Hardware Test window (`--diagnostics`).
+    diagnostics: bool,
     /// Started by "Restart as administrator": the previous window may still
     /// be shutting down.
     relaunched: bool,
@@ -47,6 +51,7 @@ fn parse_args() -> Args {
         fans: false,
         extra: false,
         updates: false,
+        diagnostics: false,
         relaunched: false,
     };
     for arg in std::env::args().skip(1) {
@@ -57,6 +62,7 @@ fn parse_args() -> Args {
             "--fans" => a.fans = true,
             "--extra" => a.extra = true,
             "--updates" => a.updates = true,
+            "--diagnostics" => a.diagnostics = true,
             "--relaunched" => a.relaunched = true,
             _ => {}
         }
@@ -172,6 +178,16 @@ fn main() -> eframe::Result<()> {
     }
     if args.extra {
         return run_extra(args.transport);
+    }
+    if args.diagnostics {
+        let kind = args.transport;
+        return run_child(
+            windows::core::w!("Local\\OpenSense.Diag"),
+            diag_window::title(),
+            diag_window::WIDTH,
+            560.0,
+            move |cc| Box::new(diag_window::DiagApp::new(cc, kind)),
+        );
     }
     if args.updates {
         return run_child(

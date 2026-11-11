@@ -36,7 +36,7 @@ LanguageDetectionMethod=uilanguage
 UninstallDisplayIcon={app}\opensense.exe
 UninstallDisplayName=OpenSense
 CloseApplications=no
-#ifexist "opensense.ico"
+#ifexist AddBackslash(SourcePath) + "opensense.ico"
 SetupIconFile=opensense.ico
 #endif
 
@@ -80,6 +80,7 @@ Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM opensense.exe"; Flags: runhi
 [UninstallDelete]
 ; Left behind by the in-app updater.
 Type: files; Name: "{app}\*.old"
+Type: files; Name: "{app}\*.old.*"
 
 [Code]
 // Stop a running OpenSense (tray agent and windows) so its files can be

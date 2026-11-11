@@ -1445,6 +1445,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
+name = "itoa"
+version = "1.0.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
+
+[[package]]
 name = "jni"
 version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2111,7 +2117,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "opensense"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -2121,6 +2127,8 @@ dependencies = [
  "opensense-proto",
  "opensense-sys",
  "parking_lot",
+ "serde",
+ "serde_json",
  "sha2",
  "tracing",
  "tracing-subscriber",
@@ -2131,7 +2139,7 @@ dependencies = [
 
 [[package]]
 name = "opensense-cli"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -2143,7 +2151,7 @@ dependencies = [
 
 [[package]]
 name = "opensense-hw"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "crossbeam-channel",
  "opensense-proto",
@@ -2156,14 +2164,14 @@ dependencies = [
 
 [[package]]
 name = "opensense-proto"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "opensense-sys"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "directories",
  "serde",
@@ -2604,6 +2612,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "serde_json"
+version = "1.0.154"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
+dependencies = [
+ "itoa",
+ "memchr",
+ "serde",
+ "serde_core",
+ "zmij",
 ]
 
 [[package]]
@@ -3934,3 +3955,9 @@ name = "zlib-rs"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
+
+[[package]]
+name = "zmij"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"

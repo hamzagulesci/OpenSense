@@ -45,7 +45,7 @@ const OEM_DIR: &str = r"C:\ProgramData\oem\NitroSense";
 /// Minimal INI lookup (case-insensitive section/key).
 pub fn ini_value(text: &str, section: &str, key: &str) -> Option<String> {
     let mut in_section = false;
-    for line in text.lines() {
+    for line in text.trim_start_matches('\u{feff}').lines() {
         let line = line.trim();
         if line.starts_with('[') && line.ends_with(']') {
             in_section = line[1..line.len() - 1].trim().eq_ignore_ascii_case(section);

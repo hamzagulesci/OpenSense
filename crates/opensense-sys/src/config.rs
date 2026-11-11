@@ -272,15 +272,35 @@ impl AppConfig {
     /// Loads the config, falling back to defaults when missing or invalid.
     pub fn load() -> Self {
         let Some(path) = Self::path() else { return Self::default() };
-        match std::fs::read_to_string(&path) {
+        // Another OpenSense process may be replacing the file right now
+        // (sharing violation); defaults returned for that would later be
+        // saved over the real settings, so retry before giving up.
+        let mut read = std::fs::read_to_string(&path);
+        for _ in 0..5 {
+            match &read {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    read = std::fs::read_to_string(&path);
+                }
+                _ => break,
+            }
+        }
+        let keep_copy = |why: &dyn std::fmt::Display| {
+            // Keep the broken file for the user instead of overwriting it.
+            let backup = path.with_extension("toml.bad");
+            tracing::warn!("invalid {}: {why}; saved a copy as {}", path.display(), backup.display());
+            let _ = std::fs::copy(&path, backup);
+        };
+        match read {
             Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
-                // Keep the broken file for the user instead of overwriting it.
-                let backup = path.with_extension("toml.bad");
-                tracing::warn!("invalid {}: {e}; saved a copy as {}", path.display(), backup.display());
-                let _ = std::fs::copy(&path, backup);
+                keep_copy(&e);
                 Self::default()
             }),
-            Err(_) => Self::default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => {
+                keep_copy(&e);
+                Self::default()
+            }
         }
     }
 

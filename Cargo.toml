@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.2"
 edition = "2021"
 license = "MIT"
 # `u64::is_multiple_of` (1.87) and `slice::as_chunks` (1.88).
@@ -30,6 +30,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"
+serde_json = "1"
 
 [profile.release]
 lto = "fat"

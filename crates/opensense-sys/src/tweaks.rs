@@ -14,6 +14,12 @@ pub mod setting {
         (0x4f971e89_eebd_4455_a8de_9e59040e7347, 0x5ca83367_6e45_459f_a27b_476b1d01c936);
     pub const HIBERNATE_AFTER: (u128, u128) =
         (0x238c9fa8_0aad_41ed_83f4_97be242c8f20, 0x9d7815a6_7ee4_497e_8888_515a05f02364);
+    /// Sleep after (seconds idle; 0 = never).
+    pub const SLEEP_AFTER: (u128, u128) =
+        (0x238c9fa8_0aad_41ed_83f4_97be242c8f20, 0x29f6c1db_86da_48c5_9fdb_f2b67b1f44da);
+    /// Turn off the display after (seconds idle; 0 = never).
+    pub const DISPLAY_OFF_AFTER: (u128, u128) =
+        (0x7516b95f_f776_4464_8c53_06167f40cc99, 0x3c0bc021_c8a8_4e07_a973_6b14cbcb2b7e);
 }
 
 /// Vendor services that drive the same firmware interface as OpenSense.

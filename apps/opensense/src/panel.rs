@@ -153,12 +153,28 @@ fn post_close(prop: &str) -> bool {
 }
 
 /// Child windows, by window property.
-const CHILDREN: [&str; 3] =
-    [crate::fans_window::MARK_PROP, crate::extra_window::MARK_PROP, crate::updates_window::MARK_PROP];
+const CHILDREN: [&str; 4] = [
+    crate::fans_window::MARK_PROP,
+    crate::extra_window::MARK_PROP,
+    crate::updates_window::MARK_PROP,
+    crate::diag_window::MARK_PROP,
+];
 
 /// Opens a child window, or closes it when it is open. Only one child is
 /// open at a time: opening one closes the others.
-fn toggle_child(prop: &str, args: &[&str]) {
+pub fn toggle_child(prop: &str, args: &[&str]) {
+    // The Hardware Test window hides instead of closing (it keeps its
+    // results); asking for it again brings it back.
+    if let Some((hwnd, _)) = crate::tray::find_marked_window(prop) {
+        use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+        if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+            for other in CHILDREN.into_iter().filter(|p| *p != prop) {
+                post_close(other);
+            }
+            crate::tray::raise_window(hwnd);
+            return;
+        }
+    }
     if post_close(prop) {
         return;
     }
@@ -192,11 +208,36 @@ fn tick_count() -> usize {
     unsafe { windows::Win32::System::SystemInformation::GetTickCount() as usize }
 }
 
+/// Opens a URL in the default browser. Through the shell directly: `cmd /c
+/// start` treats every `&` in a query string as a command separator and
+/// would cut the URL there.
 pub fn open_url(url: &str) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let _ =
-        std::process::Command::new("cmd.exe").args(["/c", "start", "", url]).creation_flags(CREATE_NO_WINDOW).spawn();
+    use windows::core::{w, HSTRING};
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return;
+    }
+    let r = unsafe { ShellExecuteW(None, w!("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL) };
+    if r.0 as usize <= 32 {
+        tracing::warn!("cannot open {url}");
+    }
+}
+
+/// While `busy`, refuses a request to close the window (title-bar X, or
+/// another window asking) and remembers it in `pending`; closes once the
+/// work is done. Keeps a hardware test, calibration or update from being
+/// cut off half-way.
+pub fn hold_close(ctx: &egui::Context, busy: bool, pending: &mut bool) {
+    if busy {
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            *pending = true;
+        }
+    } else if *pending {
+        *pending = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
 }
 
 /// `powercfg /batteryreport` into the temp folder, then opens it.
@@ -223,7 +264,10 @@ fn battery_report() {
 /// Inline colour picker under the keyboard row.
 struct Picker {
     color: Color32,
-    original: Color32,
+    /// Lighting when the picker opened, restored by Cancel if a colour was
+    /// applied meanwhile (all zones, not just the first one's colour).
+    original: opensense_sys::config::LightingConfig,
+    applied: bool,
 }
 
 pub struct QuickPanel {
@@ -359,6 +403,7 @@ impl QuickPanel {
     /// Follows the settings file (theme, language, choices made in other
     /// windows) and the Windows theme without a noticeable delay.
     fn housekeeping(&mut self, ctx: &egui::Context) {
+        crate::tray::keep_tray_only();
         let mut theme_due = self.theme_checked.elapsed() > Duration::from_secs(1);
         if self.config_checked.elapsed() > Duration::from_millis(200) {
             self.config_checked = Instant::now();
@@ -550,6 +595,7 @@ impl eframe::App for QuickPanel {
         post_close(crate::fans_window::MARK_PROP);
         post_close(crate::extra_window::MARK_PROP);
         post_close(crate::updates_window::MARK_PROP);
+        post_close(crate::diag_window::MARK_PROP);
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -835,7 +881,9 @@ impl QuickPanel {
                 if ui::color_button(ui, cells[1], "kb", self.t("Color"), &swatches).clicked() {
                     self.picker = match self.picker {
                         Some(_) => None,
-                        None => Some(Picker { color: swatches[0], original: swatches[0] }),
+                        None => {
+                            Some(Picker { color: swatches[0], original: self.cfg.lighting.clone(), applied: false })
+                        }
                     };
                 }
             } else {
@@ -915,6 +963,7 @@ impl QuickPanel {
                     ui.painter().rect_stroke(r, 2.0, edge);
                     if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         picker.color = c;
+                        picker.applied = true;
                         self.set_keyboard_color(c);
                     }
                 }
@@ -935,8 +984,9 @@ impl QuickPanel {
                     close = true;
                 }
                 if ui::row_button(ui, cells[2], "picker-cancel", self.t("Cancel"), None, true).clicked() {
-                    if picker.original != picker.color {
-                        self.set_keyboard_color(picker.original);
+                    if picker.applied {
+                        self.cfg.lighting = picker.original.clone();
+                        self.apply_lighting();
                     }
                     close = true;
                 }
@@ -978,7 +1028,7 @@ impl QuickPanel {
             let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), egui::Sense::hover());
             let pill = Rect::from_min_size(Pos2::new(row.right() - 36.5, row.center().y - 9.0), Vec2::new(36.5, 18.0));
             let track =
-                Rect::from_min_max(row.min, Pos2::new(pill.left() - 6.0, row.max.y)).shrink2(Vec2::new(0.0, 1.0));
+                Rect::from_min_max(row.min, Pos2::new(pill.left() - 12.0, row.max.y)).shrink2(Vec2::new(0.0, 1.0));
             let supported = [80.0, 85.0, 90.0, 95.0, 100.0];
             let out = ui::slider(ui, track, "charge", f32::from(saved), 80.0, 100.0, 5.0, &supported, theme::STANDARD);
             ui.ctx().data_mut(|d| {

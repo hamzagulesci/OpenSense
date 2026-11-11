@@ -257,13 +257,19 @@ fn main() -> Result<()> {
             let m = M::from_name(&method).with_context(|| format!("unknown method '{method}'"))?;
             let v = u64::from_str_radix(value.trim_start_matches("0x"), 16).context("value must be hex")?;
             match op.as_str() {
-                "get" => println!("{}({v:#x}) -> {:#018x}", m.qualified_name(), dev.raw_get(m, v as u32)?),
+                "get" => {
+                    let input = u32::try_from(v).context("get takes a 32-bit value")?;
+                    println!("{}({v:#x}) -> {:#018x}", m.qualified_name(), dev.raw_get(m, input)?)
+                }
                 "set" => println!("{}({v:#x}) -> status {:#x}", m.qualified_name(), dev.raw_set(m, v)?),
                 "set-bytes" => {
                     println!("{}({v:#x} as 16 bytes) -> status {:#x}", m.qualified_name(), dev.raw_set_bytes(m, v)?)
                 }
                 other => bail!("unknown op '{other}' (get|set|set-bytes)"),
             }
+        }
+        Cmd::Fan { mode: FanArg::Auto | FanArg::Max, cpu, gpu } if cpu.is_some() || gpu.is_some() => {
+            bail!("--cpu / --gpu only apply to custom mode")
         }
         Cmd::Fan { mode, cpu, gpu } => match mode {
             FanArg::Auto => dev.set_fans_auto()?,

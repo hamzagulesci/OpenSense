@@ -29,7 +29,7 @@ use windows::Win32::System::Variant::{
 };
 use windows::Win32::System::Wmi::{
     IWbemClassObject, IWbemLocator, IWbemServices, WbemLocator, WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY,
-    WBEM_GENERIC_FLAG_TYPE, WBEM_INFINITE,
+    WBEM_GENERIC_FLAG_TYPE,
 };
 
 use crate::{GamingTransport, HwError, WmiValue};
@@ -51,13 +51,18 @@ enum Output {
     Bytes(Vec<u8>),
 }
 
+/// A queued call. `deadline` is when its caller stops waiting: a request
+/// still queued by then (behind a hung call) is dropped rather than run
+/// late, so a stale fan or mode write cannot land on top of newer state.
 enum Request {
     Gaming {
         method: GamingMethod,
         input: Input,
+        deadline: std::time::Instant,
         reply: Sender<Result<Output, HwError>>,
     },
     Raw {
+        deadline: std::time::Instant,
         class: &'static str,
         method: &'static str,
         inputs: Vec<(&'static str, WmiValue)>,
@@ -94,11 +99,15 @@ impl WmiTransport {
                     }
                 };
                 for req in rx {
+                    let expired = |d: std::time::Instant| std::time::Instant::now() >= d;
                     match req {
-                        Request::Gaming { method, input, reply } => {
+                        Request::Gaming { deadline, .. } | Request::Raw { deadline, .. } if expired(deadline) => {
+                            tracing::warn!("dropped a firmware call that waited too long");
+                        }
+                        Request::Gaming { method, input, reply, .. } => {
                             let _ = reply.send(unsafe { session.call(method, input) });
                         }
-                        Request::Raw { class, method, inputs, outputs, reply } => {
+                        Request::Raw { class, method, inputs, outputs, reply, .. } => {
                             let _ = reply.send(unsafe { session.call_raw(class, method, &inputs, &outputs) });
                         }
                     }
@@ -107,15 +116,39 @@ impl WmiTransport {
                 unsafe { CoUninitialize() };
             })
             .map_err(|e| HwError::Wmi(e.to_string()))?;
-        ready_rx.recv().map_err(|_| HwError::Wmi("WMI worker exited".into()))??;
+        // Bounded: connecting to a stuck WMI service must not hang the caller.
+        match ready_rx.recv_timeout(CONNECT_TIMEOUT) {
+            Ok(r) => r?,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                return Err(HwError::Wmi("connecting to WMI timed out".into()))
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                return Err(HwError::Wmi("WMI worker exited".into()))
+            }
+        }
         Ok(Self { tx })
     }
 
     fn call(&self, method: GamingMethod, input: Input) -> Result<Output, HwError> {
         let (reply, rx) = bounded(1);
-        self.tx.send(Request::Gaming { method, input, reply }).map_err(|_| HwError::Wmi("WMI worker exited".into()))?;
+        self.submit(Request::Gaming { method, input, deadline: deadline(), reply })?;
         wait_reply(&rx)
     }
+
+    /// Queues a request; fails instead of blocking when the queue is full
+    /// (the worker is stuck in a call).
+    fn submit(&self, req: Request) -> Result<(), HwError> {
+        self.tx.send_timeout(req, CALL_TIMEOUT).map_err(|e| match e {
+            crossbeam_channel::SendTimeoutError::Timeout(_) => HwError::Wmi("firmware call timed out".into()),
+            crossbeam_channel::SendTimeoutError::Disconnected(_) => HwError::Wmi("WMI worker exited".into()),
+        })
+    }
+}
+
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn deadline() -> std::time::Instant {
+    std::time::Instant::now() + CALL_TIMEOUT
 }
 
 /// Longest a firmware call may take. A call that hangs (ACPI stuck after
@@ -183,9 +216,14 @@ impl GamingTransport for WmiTransport {
         outputs: &[&'static str],
     ) -> Result<Vec<WmiValue>, HwError> {
         let (reply, rx) = bounded(1);
-        self.tx
-            .send(Request::Raw { class, method, inputs: inputs.to_vec(), outputs: outputs.to_vec(), reply })
-            .map_err(|_| HwError::Wmi("WMI worker exited".into()))?;
+        self.submit(Request::Raw {
+            deadline: deadline(),
+            class,
+            method,
+            inputs: inputs.to_vec(),
+            outputs: outputs.to_vec(),
+            reply,
+        })?;
         wait_reply(&rx)
     }
 }
@@ -283,7 +321,8 @@ impl Session {
             .map_err(map_err)?;
         let mut objs = [None];
         let mut returned = 0u32;
-        enumerator.Next(WBEM_INFINITE, &mut objs, &mut returned).ok().map_err(map_err)?;
+        // 10 s at most; a timeout returns no object (NotPresent below).
+        enumerator.Next(10_000, &mut objs, &mut returned).ok().map_err(map_err)?;
         let instance = match (returned, objs[0].take()) {
             (1, Some(o)) => o,
             _ => return Err(HwError::NotPresent),
