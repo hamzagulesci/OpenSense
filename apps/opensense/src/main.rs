@@ -15,6 +15,9 @@ mod nvidia;
 mod osd;
 mod overlay;
 mod panel;
+mod restore;
+// Unused until tray.rs creates a `SessionEnd`; remove the allow then.
+mod session_end;
 mod tray;
 mod updates;
 mod updates_window;
@@ -140,13 +143,18 @@ fn main() -> eframe::Result<()> {
         }
         return Ok(());
     }
+    // Used by the uninstaller after `--quit`: undo the Windows settings
+    // OpenSense changed (power plan, lid action, NVIDIA clock lock, Acer
+    // services), then exit.
+    if std::env::args().any(|a| a == "--restore-system") {
+        restore::run();
+        return Ok(());
+    }
     // Used by the installer: the language picked in the setup, then exit.
     let argv: Vec<String> = std::env::args().collect();
     if let Some(i) = argv.iter().position(|a| a == "--set-language") {
         if let Some(code @ ("en" | "tr")) = argv.get(i + 1).map(String::as_str) {
-            let mut cfg = opensense_sys::config::AppConfig::load();
-            cfg.language = code.into();
-            if let Err(e) = cfg.save() {
+            if let Err(e) = opensense_sys::config::AppConfig::update(|c| c.language = code.into()) {
                 tracing::warn!("cannot save settings: {e}");
             }
         }

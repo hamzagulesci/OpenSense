@@ -13,6 +13,7 @@ use opensense_proto::mode::GpuMode;
 use opensense_sys::config::AppConfig;
 use opensense_sys::config::TempUnit;
 use opensense_sys::oem::OemInfo;
+use opensense_sys::SysError;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use windows::core::PWSTR;
@@ -331,13 +332,64 @@ pub fn toggle_window(mock: bool) {
     spawn_detached(if mock { &["--panel", "--mock"] } else { &["--panel"] });
 }
 
-/// Persists a tray-menu choice so the window and the next start agree.
-fn save_choice(update: impl FnOnce(&mut AppConfig)) {
-    let mut cfg = AppConfig::load();
-    update(&mut cfg);
-    if let Err(e) = cfg.save() {
+/// Saves a settings change field by field. Every process keeps its own copy
+/// of the settings, so saving a whole copy could undo what another process
+/// saved meanwhile. Instead `edit` is applied to what the file holds now,
+/// under the cross-process write lock, and `cfg` becomes that result. When
+/// the file cannot be written `edit` is still applied to `cfg`, so the
+/// change shows. `edit` should only set the fields the action changed (and
+/// set them to values, not toggle what the file holds).
+pub fn edit_config(cfg: &mut AppConfig, mut edit: impl FnMut(&mut AppConfig)) -> Result<(), SysError> {
+    match AppConfig::update(&mut edit) {
+        Ok(fresh) => {
+            *cfg = fresh;
+            Ok(())
+        }
+        Err(e) => {
+            edit(cfg);
+            Err(e)
+        }
+    }
+}
+
+/// [`edit_config`] for the tray agent: a failure is only logged.
+fn save_choice(cfg: &mut AppConfig, edit: impl FnMut(&mut AppConfig)) {
+    if let Err(e) = edit_config(cfg, edit) {
         tracing::warn!("cannot save settings: {e}");
     }
+}
+
+/// Saves what the automation (shortcuts, mode per power source, clamshell)
+/// changed in the agent's copy since `before`: only the fields
+/// `automation.rs` sets, and only those that differ.
+fn save_automation(before: &AppConfig, cfg: &mut AppConfig) {
+    let now = cfg.clone();
+    save_choice(cfg, |c| {
+        if now.current_mode != before.current_mode {
+            c.current_mode.clone_from(&now.current_mode);
+        }
+        if now.operation_mode != before.operation_mode {
+            c.operation_mode.clone_from(&now.operation_mode);
+        }
+        if now.fan.mode != before.fan.mode {
+            c.fan.mode = now.fan.mode;
+        }
+        if now.overlay != before.overlay {
+            c.overlay = now.overlay;
+        }
+        if now.lighting.brightness_level != before.lighting.brightness_level {
+            c.lighting.brightness_level = now.lighting.brightness_level;
+        }
+        if now.mode_ac != before.mode_ac {
+            c.mode_ac.clone_from(&now.mode_ac);
+        }
+        if now.mode_dc != before.mode_dc {
+            c.mode_dc.clone_from(&now.mode_dc);
+        }
+        if now.clamshell_default_lid != before.clamshell_default_lid {
+            c.clamshell_default_lid = now.clamshell_default_lid;
+        }
+    });
 }
 
 /// What a tray-menu entry does.
@@ -533,8 +585,7 @@ impl Drop for FanGuard {
 fn charge_tick(cfg: &mut AppConfig, worker: &worker::WorkerHandle, cap: Option<bool>, percent: Option<u8>) {
     if cfg.charge_full {
         if percent.is_some_and(|p| p > 99) {
-            cfg.charge_full = false;
-            save_choice(|c| c.charge_full = false);
+            save_choice(cfg, |c| c.charge_full = false);
             let target = cfg.charge_target().unwrap_or(100);
             if let Some(on) = cap.and_then(|cap| crate::apply::charge_cap_for(target, percent, cap)) {
                 let _ = worker.tx.send(Command::ChargeLimit(on));
@@ -583,6 +634,8 @@ pub fn run(kind: TransportKind) {
 
     let worker = worker::spawn(kind, &oem, Duration::from_secs(1), 4, false, || {});
     let mut guard = FanGuard { kind, profile: worker::device_profile(&oem), restore: None };
+    // Hands the fans back at sign-out / shutdown too.
+    let session_end = crate::session_end::SessionEnd::new(kind, worker::device_profile(&oem));
     // Saved firmware settings are sent whenever a connection is made (first
     // connect, reconnect) and after resume; see the timer tick below.
     let mut applied_connects = 0u32;
@@ -678,28 +731,27 @@ pub fn run(kind: TransportKind) {
             }
         }
         for h in hotkeys {
+            let before = cfg.clone();
             let changed = auto.hotkey(h, &mut cfg, &worker, lang, mock);
-            sync_overlay(&mut overlay, &cfg);
             if changed {
                 last_switch = std::time::Instant::now();
                 fan_loop.reset();
-                if let Err(e) = cfg.save() {
-                    tracing::warn!("cannot save settings: {e}");
-                }
+                save_automation(&before, &mut cfg);
             }
+            sync_overlay(&mut overlay, &cfg);
         }
         if tick {
+            let before = cfg.clone();
             if auto.tick(&mut cfg, &worker, lang) {
-                if let Err(e) = cfg.save() {
-                    tracing::warn!("cannot save settings: {e}");
-                }
+                save_automation(&before, &mut cfg);
             }
             if let Some(o) = overlay.as_mut() {
                 if o.tick(&mut cfg, &crate::overlay::metrics(&worker)) {
-                    save_choice(|c| {
-                        c.overlay_mode = cfg.overlay_mode;
-                        c.overlay_scale = cfg.overlay_scale;
-                        c.overlay_pos = cfg.overlay_pos;
+                    let (mode, scale, pos) = (cfg.overlay_mode, cfg.overlay_scale, cfg.overlay_pos);
+                    save_choice(&mut cfg, |c| {
+                        c.overlay_mode = mode;
+                        c.overlay_scale = scale;
+                        c.overlay_pos = pos;
                     });
                 }
             }
@@ -759,6 +811,7 @@ pub fn run(kind: TransportKind) {
                 let _ = worker.tx.send(crate::apply::fan(&cfg.fan));
             }
             guard.restore = fan_loop.active().then(|| cfg.fan.clone());
+            session_end.set_restore(guard.restore.clone());
 
             charge_tick(&mut cfg, &worker, now.cap, now.percent);
 
@@ -770,11 +823,11 @@ pub fn run(kind: TransportKind) {
                     crate::modes::base_mode(&key).is_some() && crate::modes::BUILTIN.iter().any(|(_, b)| *b == m);
                 let settled = last_switch.elapsed() > Duration::from_secs(10);
                 if builtin && settled && crate::modes::base_of(&cfg, &key) != m {
-                    cfg.current_mode = Some(m.label().to_ascii_lowercase());
-                    cfg.operation_mode = cfg.current_mode.clone();
-                    if let Err(e) = cfg.save() {
-                        tracing::warn!("cannot save settings: {e}");
-                    }
+                    let name = m.label().to_ascii_lowercase();
+                    save_choice(&mut cfg, |c| {
+                        c.current_mode = Some(name.clone());
+                        c.operation_mode = Some(name.clone());
+                    });
                 }
             }
 
@@ -829,12 +882,10 @@ pub fn run(kind: TransportKind) {
             match action {
                 Action::Mode(key) => {
                     let key = key.clone();
-                    crate::modes::switch(&mut cfg, &key, &worker);
+                    save_choice(&mut cfg, |c| crate::modes::select(c, &key));
+                    crate::modes::activate(&cfg, &key, &worker);
                     last_switch = std::time::Instant::now();
                     fan_loop.reset();
-                    if let Err(e) = cfg.save() {
-                        tracing::warn!("cannot save settings: {e}");
-                    }
                     menu_state.0.clear();
                 }
                 Action::Gpu(m) => {
@@ -850,21 +901,21 @@ pub fn run(kind: TransportKind) {
                     menu_state.0.clear();
                 }
                 Action::BwIcon => {
-                    cfg.bw_icon = !cfg.bw_icon;
-                    save_choice(|c| c.bw_icon = !c.bw_icon);
+                    let on = !cfg.bw_icon;
+                    save_choice(&mut cfg, |c| c.bw_icon = on);
                     let _ = tray.set_icon(tray_icon(cfg.bw_icon));
                     menu_state.0.clear();
                 }
                 Action::Overlay => {
-                    cfg.overlay = !cfg.overlay;
-                    save_choice(|c| c.overlay = !c.overlay);
+                    let on = !cfg.overlay;
+                    save_choice(&mut cfg, |c| c.overlay = on);
                     sync_overlay(&mut overlay, &cfg);
                     menu_state.0.clear();
                 }
                 Action::OverlayGameOnly => {
-                    cfg.overlay_game_only = !cfg.overlay_game_only;
+                    let on = !cfg.overlay_game_only;
+                    save_choice(&mut cfg, |c| c.overlay_game_only = on);
                     game_only = cfg.overlay_game_only;
-                    save_choice(|c| c.overlay_game_only = !c.overlay_game_only);
                     overlay = None;
                     sync_overlay(&mut overlay, &cfg);
                     menu_state.0.clear();

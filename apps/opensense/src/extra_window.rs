@@ -42,6 +42,12 @@ pub struct ExtraApp {
     timeouts: [Option<u32>; 3],
     timeouts_read: Instant,
     message: String,
+    /// A zone colour was changed in the picker but not yet sent to the
+    /// keyboard and saved (done once the drag ends or the popup closes).
+    lighting_pending: bool,
+    /// A backlight timeout field was changed but not yet saved (done once
+    /// the drag ends or the field loses focus).
+    timeout_pending: bool,
 }
 
 impl ExtraApp {
@@ -67,6 +73,8 @@ impl ExtraApp {
             timeouts: read_timeouts(),
             timeouts_read: Instant::now(),
             message: String::new(),
+            lighting_pending: false,
+            timeout_pending: false,
         };
         app.refresh_services();
         app
@@ -85,17 +93,92 @@ impl ExtraApp {
         });
     }
 
-    fn save(&mut self) {
-        if let Err(e) = self.cfg.save() {
+    /// Saves the fields `edit` sets (see [`crate::tray::edit_config`]); the
+    /// window's copy becomes the file's current settings, except for edits
+    /// still waiting for their drag to end.
+    fn edit(&mut self, edit: impl FnMut(&mut AppConfig)) {
+        let lighting = self.lighting_pending.then(|| self.cfg.lighting.clone());
+        let timeouts = self.timeout_pending.then_some((self.cfg.kb_timeout_ac, self.cfg.kb_timeout_battery));
+        if let Err(e) = crate::tray::edit_config(&mut self.cfg, edit) {
             self.message = e.to_string();
         }
+        if let Some(l) = lighting {
+            self.cfg.lighting = l;
+        }
+        if let Some((ac, battery)) = timeouts {
+            (self.cfg.kb_timeout_ac, self.cfg.kb_timeout_battery) = (ac, battery);
+        }
         self.modified = crate::fans_window::config_mtime();
+        self.lang = Lang::resolve(&self.cfg.language);
         crate::tray::notify_config_changed();
     }
 
+    /// Sends the lighting edited in the window's copy and saves it.
     fn apply_lighting(&mut self) {
+        self.lighting_pending = false;
         let _ = self.worker.tx.send(crate::apply::lighting(&self.cfg.lighting));
-        self.save();
+        let lighting = self.cfg.lighting.clone();
+        self.edit(|c| c.lighting.clone_from(&lighting));
+    }
+
+    fn save_timeouts(&mut self) {
+        self.timeout_pending = false;
+        let (ac, battery) = (self.cfg.kb_timeout_ac, self.cfg.kb_timeout_battery);
+        self.edit(|c| (c.kb_timeout_ac, c.kb_timeout_battery) = (ac, battery));
+    }
+
+    /// Applies and saves edits still waiting for their drag to end (used
+    /// when the window closes mid-edit).
+    fn flush_pending(&mut self) {
+        if self.lighting_pending {
+            self.apply_lighting();
+        }
+        if self.timeout_pending {
+            self.save_timeouts();
+        }
+    }
+
+    fn close(&mut self, ctx: &egui::Context) {
+        self.flush_pending();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// Turns the "Disable PCIe Link State Management" option on or off. The
+    /// plugged-in value the power plan had before is remembered and put back
+    /// when the option is turned off. Returns false (and shows the error)
+    /// when Windows refused the change.
+    fn set_aspm(&mut self, off: bool) -> bool {
+        let result = if off {
+            // Remember the plan's own value; a 0 means it was already off
+            // (e.g. re-enabled after a crash), so keep what was stored.
+            match tweaks::read(setting::ASPM) {
+                Ok((ac, _)) if ac != 0 => self.cfg.aspm_previous = Some(ac),
+                Ok(_) => {}
+                Err(e) => {
+                    self.message = format!("{} {e}", self.t("Could not change the PCIe setting:"));
+                    return false;
+                }
+            }
+            tweaks::write(setting::ASPM, Some(0), None)
+        } else {
+            // Without a remembered value use "Moderate power savings", the
+            // plugged-in default of the Balanced plan.
+            let previous = self.cfg.aspm_previous.unwrap_or(1);
+            tweaks::write(setting::ASPM, Some(previous), None)
+        };
+        match result {
+            Ok(()) => {
+                if !off {
+                    self.cfg.aspm_previous = None;
+                }
+                self.message.clear();
+                true
+            }
+            Err(e) => {
+                self.message = format!("{} {e}", self.t("Could not change the PCIe setting:"));
+                false
+            }
+        }
     }
 }
 
@@ -120,12 +203,17 @@ impl eframe::App for ExtraApp {
         }
         // Like a flyout: switching to another app closes the window.
         if self.away.gone(ctx) && !self.cfg.topmost {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            self.close(ctx);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            self.close(ctx);
         }
-        if self.checked.elapsed() > Duration::from_millis(200) {
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.flush_pending();
+        }
+        // Not while an edit is waiting to be saved: reloading would undo it.
+        let pending = self.lighting_pending || self.timeout_pending;
+        if !pending && self.checked.elapsed() > Duration::from_millis(200) {
             self.checked = Instant::now();
             let m = crate::fans_window::config_mtime();
             if m != self.modified {
@@ -159,8 +247,7 @@ impl ExtraApp {
         header(ui, Icon::Keyboard, self.t("Key Bindings"));
         let mut on = self.cfg.hotkeys;
         if check(ui, "hotkeys", self.t("Enable keyboard shortcuts"), &mut on) {
-            self.cfg.hotkeys = on;
-            self.save();
+            self.edit(|c| c.hotkeys = on);
         }
         let p = pal();
         for (h, combo) in HOTKEYS {
@@ -247,11 +334,12 @@ impl ExtraApp {
             theme::STANDARD,
         );
         if let Some(v) = out.commit {
-            self.cfg.lighting.speed = v as u8;
+            let speed = v as u8;
+            self.cfg.lighting.speed = speed;
             if dynamic {
                 self.apply_lighting();
             } else {
-                self.save();
+                self.edit(|c| c.lighting.speed = speed);
             }
         }
         let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW), Sense::hover());
@@ -279,7 +367,7 @@ impl ExtraApp {
                 if dynamic {
                     self.apply_lighting();
                 } else {
-                    self.save();
+                    self.edit(|c| c.lighting.direction = dir.into());
                 }
             }
         }
@@ -304,15 +392,21 @@ impl ExtraApp {
                 }
             });
         }
+        // The swatch follows the picker live; the keyboard and the settings
+        // file are only written once the mouse is released (drag ended or
+        // popup closed), not on every drag frame.
         if changed {
             self.cfg.lighting.kind = LightingKind::Static;
+            self.lighting_pending = true;
+        }
+        if self.lighting_pending && !ui.input(|i| i.pointer.any_down()) {
             self.apply_lighting();
         }
         // Backlight timeouts.
         let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW), Sense::hover());
         label_left(ui, row, self.t("Backlight timeout plugged / on battery"), true);
         let (off, sec) = (self.t("Off"), self.t("sec"));
-        let mut save = false;
+        let mut editing = false;
         for (i, value) in [&mut self.cfg.kb_timeout_ac, &mut self.cfg.kb_timeout_battery].into_iter().enumerate() {
             let x = row.right() - 10.0 - (2 - i) as f32 * 82.0 + 4.0;
             let r = Rect::from_min_size(Pos2::new(x, row.top() + 3.0), Vec2::new(78.0, row.height() - 6.0));
@@ -327,11 +421,13 @@ impl ExtraApp {
                         }
                     }),
                 );
-                save |= resp.changed();
+                self.timeout_pending |= resp.changed();
+                editing |= resp.dragged() || resp.has_focus();
             });
         }
-        if save {
-            self.save();
+        // Saved once the value is committed: drag ended or focus lost.
+        if self.timeout_pending && !editing {
+            self.save_timeouts();
         }
         ui.add_space(8.0);
     }
@@ -353,73 +449,63 @@ impl ExtraApp {
                 if mock { &["--diagnostics", "--mock"] } else { &["--diagnostics"] },
             );
         }
-        let mut save = false;
         let mut v = self.cfg.aspm_off;
-        if check(ui, "aspm", self.t("Disable PCIe Link State Management (plugged in)"), &mut v) {
-            self.cfg.aspm_off = v;
-            let _ = tweaks::write(setting::ASPM, Some(if v { 0 } else { 2 }), None);
-            save = true;
+        if check(ui, "aspm", self.t("Disable PCIe Link State Management (plugged in)"), &mut v) && self.set_aspm(v) {
+            let previous = self.cfg.aspm_previous;
+            self.edit(|c| {
+                c.aspm_off = v;
+                c.aspm_previous = previous;
+            });
         }
         let mut v = self.cfg.standby_network_off;
         if check(ui, "standby", self.t("Disable networking in Modern Standby"), &mut v) {
-            self.cfg.standby_network_off = v;
             let (ac, dc) = if v { (0, 0) } else { (1, 2) };
             let _ = tweaks::write(setting::STANDBY_NETWORK, Some(ac), Some(dc));
-            save = true;
+            self.edit(|c| c.standby_network_off = v);
         }
         let mut v = self.cfg.topmost;
         if check(ui, "topmost", self.t("Keep app window always on top"), &mut v) {
-            self.cfg.topmost = v;
-            save = true;
+            self.edit(|c| c.topmost = v);
         }
         let mut v = self.cfg.clamshell;
         if check(ui, "clamshell", self.t("Auto Toggle Clamshell Mode"), &mut v) {
-            self.cfg.clamshell = v;
-            save = true;
+            self.edit(|c| c.clamshell = v);
         }
         let mut v = self.cfg.bw_icon;
         if check(ui, "bw", self.t("Black and white tray icon"), &mut v) {
-            self.cfg.bw_icon = v;
-            save = true;
+            self.edit(|c| c.bw_icon = v);
         }
         let mut v = !self.cfg.disable_osd;
         if check(ui, "osd", self.t("Show on-screen notifications"), &mut v) {
-            self.cfg.disable_osd = !v;
-            save = true;
+            self.edit(|c| c.disable_osd = !v);
         }
         let mut v = self.cfg.apply_on_start;
         if check(ui, "restore", self.t("Restore settings at startup"), &mut v) {
-            self.cfg.apply_on_start = v;
-            save = true;
+            self.edit(|c| c.apply_on_start = v);
         }
         // Appearance.
         let lang = self.lang;
         let themes = [("windows", "Windows"), ("dark", "Dark"), ("light", "Light")];
         let cur = themes.iter().position(|(k, _)| *k == self.cfg.ui_mode).unwrap_or(0);
         if let Some(i) = combo_row(ui, "theme", tr(lang, "Theme"), cur, &themes.map(|(_, n)| tr(lang, n))) {
-            self.cfg.ui_mode = themes[i].0.into();
+            self.edit(|c| c.ui_mode = themes[i].0.into());
             self.dark = theme::is_dark(&self.cfg.ui_mode);
             theme::apply(ui.ctx(), self.dark);
             if let Some((hwnd, _)) = crate::tray::find_marked_window(MARK_PROP) {
                 theme::title_bar_of(hwnd, self.dark);
             }
-            save = true;
         }
         let langs = [("en", "English"), ("tr", "Türkçe")];
         let cur = usize::from(lang == Lang::Tr);
         if let Some(i) = combo_row(ui, "language", tr(lang, "Language"), cur, &langs.map(|(_, n)| n)) {
-            self.cfg.language = langs[i].0.into();
-            self.lang = Lang::resolve(&self.cfg.language);
+            // `edit` also picks the new language up.
+            self.edit(|c| c.language = langs[i].0.into());
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(tr(self.lang, "Extra Settings").into()));
-            save = true;
         }
         let cur = usize::from(self.cfg.temp_unit == TempUnit::Fahrenheit);
         if let Some(i) = combo_row(ui, "unit", tr(lang, "Temperature unit"), cur, &["°C", "°F"]) {
-            self.cfg.temp_unit = if i == 1 { TempUnit::Fahrenheit } else { TempUnit::Celsius };
-            save = true;
-        }
-        if save {
-            self.save();
+            let unit = if i == 1 { TempUnit::Fahrenheit } else { TempUnit::Celsius };
+            self.edit(|c| c.temp_unit = unit);
         }
         ui.add_space(8.0);
     }

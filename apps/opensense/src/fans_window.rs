@@ -221,8 +221,8 @@ impl FansWindow {
             match opensense_sys::power::set_power_mode(picked) {
                 Ok(()) => {
                     self.power_mode = Some(picked);
-                    let p = modes::profile_mut(cfg, &key);
-                    p.power_mode = (picked != modes::default_power_mode(base)).then(|| picked.key().to_owned());
+                    let mode = (picked != modes::default_power_mode(base)).then(|| picked.key().to_owned());
+                    edit(cfg, |c| modes::edit_profile(c, &key, |p| p.power_mode.clone_from(&mode)));
                     changed = true;
                 }
                 Err(e) => self.result = e.to_string(),
@@ -246,7 +246,7 @@ impl FansWindow {
             match opensense_sys::power::set_cpu_boost(picked) {
                 Ok(()) => {
                     self.boost = Some(picked);
-                    modes::profile_mut(cfg, &key).cpu_boost = Some(picked);
+                    edit(cfg, |c| modes::edit_profile(c, &key, |p| p.cpu_boost = Some(picked)));
                     changed = true;
                 }
                 Err(e) => self.result = e.to_string(),
@@ -279,7 +279,7 @@ impl FansWindow {
         if let Some(v) = out.commit {
             let v = v as u32;
             let new = (v < crate::nvidia::CLOCK_MAX).then_some(v);
-            modes::profile_mut(cfg, &key).gpu_clock_limit = new;
+            edit(cfg, |c| modes::edit_profile(c, &key, |p| p.gpu_clock_limit = new));
             // Forced: the tray agent may have set the lock this window knows
             // nothing about.
             std::thread::spawn(move || crate::nvidia::set_clock_limit(new, true));
@@ -323,15 +323,16 @@ impl FansWindow {
         let mut picked = self.key.clone();
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(combo_rect), |ui| {
             if self.renaming && custom {
-                let p = modes::profile_mut(cfg, &self.key);
+                let mut name = modes::profile(cfg, &self.key).name;
                 let r = ui.add_sized(
                     combo_rect.size(),
-                    egui::TextEdit::singleline(&mut p.name).vertical_align(egui::Align::Center),
+                    egui::TextEdit::singleline(&mut name).vertical_align(egui::Align::Center),
                 );
                 if !r.has_focus() && !r.lost_focus() {
                     r.request_focus();
                 }
                 if r.changed() {
+                    edit(cfg, |c| modes::edit_profile(c, &self.key, |p| p.name.clone_from(&name)));
                     changed = true;
                 }
                 if r.lost_focus() {
@@ -350,15 +351,25 @@ impl FansWindow {
             }
         });
         let add_rect = cell(w - 30.0, w - 3.0);
+        let mut added = None;
         if modes::can_add(cfg)
             && ui::row_button(ui, add_rect, "add-mode", "+", None, true).on_hover_text(t("Add mode")).clicked()
         {
-            if let Some(k) = modes::add_custom(cfg, lang) {
-                picked = k;
-            }
+            // Added and selected in one save, under a key still free in the file.
+            edit(cfg, |c| {
+                added = modes::add_custom(c, lang);
+                if let Some(k) = &added {
+                    modes::select(c, k);
+                }
+            });
         }
-        if picked != self.key {
-            modes::switch(cfg, &picked, worker);
+        if let Some(k) = added {
+            modes::activate(cfg, &k, worker);
+            self.reload(cfg);
+            changed = true;
+        } else if picked != self.key {
+            edit(cfg, |c| modes::select(c, &picked));
+            modes::activate(cfg, &picked, worker);
             self.reload(cfg);
             changed = true;
         }
@@ -405,8 +416,11 @@ impl FansWindow {
             );
             if ui::row_button(ui, del, "confirm-delete", t("Delete"), None, false).clicked() {
                 let key = self.key.clone();
-                modes::remove_custom(cfg, &key);
-                modes::switch(cfg, "default", worker);
+                edit(cfg, |c| {
+                    modes::remove_custom(c, &key);
+                    modes::select(c, "default");
+                });
+                modes::activate(cfg, "default", worker);
                 self.reload(cfg);
                 changed = true;
             }
@@ -420,7 +434,7 @@ impl FansWindow {
             .unwrap_or_else(|| ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), Sense::hover()).0);
         let mut clamp = cfg.fan_clamp;
         if ui::checkbox(ui, row.shrink2(Vec2::new(4.0, 0.0)), "clamp", t("Clamp to Grid"), &mut clamp).changed() {
-            cfg.fan_clamp = clamp;
+            edit(cfg, |c| c.fan_clamp = clamp);
             changed = true;
         }
 
@@ -450,10 +464,15 @@ impl FansWindow {
             released |= r;
         }
         if released {
-            let key = self.key.clone();
-            let p = modes::profile_mut(cfg, &key);
-            p.cpu_curve = modes::to_stored(&self.curves[0]);
-            p.gpu_curve = modes::to_stored(&self.curves[1]);
+            // Only this mode's curves are written: a mode switched meanwhile
+            // (shortcut, tray menu; reloading pauses during the drag) stays.
+            let (cpu, gpu) = (modes::to_stored(&self.curves[0]), modes::to_stored(&self.curves[1]));
+            edit(cfg, |c| {
+                modes::edit_profile(c, &self.key, |p| {
+                    p.cpu_curve.clone_from(&cpu);
+                    p.gpu_curve.clone_from(&gpu);
+                });
+            });
             changed = true;
         }
 
@@ -479,15 +498,18 @@ impl FansWindow {
         let calibrate = Rect::from_min_size(Pos2::new(row.left() + 134.0, y0), Vec2::new(80.0, 27.0));
         if ui::row_button(ui, factory, "factory", t("Factory Defaults"), None, true).clicked() {
             let key = self.key.clone();
-            let base = modes::base_of(cfg, &key);
-            let p = modes::profile_mut(cfg, &key);
-            p.cpu_curve = modes::to_stored(&modes::default_curve(base, false));
-            p.gpu_curve = modes::to_stored(&modes::default_curve(base, true));
-            p.apply_curve = false;
-            p.power_mode = None;
-            p.cpu_boost = None;
-            p.gpu_clock_limit = None;
-            let p = p.clone();
+            edit(cfg, |c| {
+                let base = modes::base_of(c, &key);
+                modes::edit_profile(c, &key, |p| {
+                    p.cpu_curve = modes::to_stored(&modes::default_curve(base, false));
+                    p.gpu_curve = modes::to_stored(&modes::default_curve(base, true));
+                    p.apply_curve = false;
+                    p.power_mode = None;
+                    p.cpu_boost = None;
+                    p.gpu_clock_limit = None;
+                });
+            });
+            let (p, base) = (modes::profile(cfg, &key), modes::base_of(cfg, &key));
             let _ = worker.tx.send(Command::FansAuto);
             std::thread::spawn(move || modes::apply_windows(&p, base));
             self.windows_read = None;
@@ -508,7 +530,7 @@ impl FansWindow {
             .changed()
         {
             let key = self.key.clone();
-            modes::profile_mut(cfg, &key).apply_curve = apply;
+            edit(cfg, |c| modes::edit_profile(c, &key, |p| p.apply_curve = apply));
             if !apply {
                 let _ = worker.tx.send(crate::apply::fan(&cfg.fan));
             }
@@ -693,7 +715,7 @@ impl FansWindow {
             let max = c.max;
             self.calibration = None;
             if max.iter().all(|&m| (3000..=10400).contains(&m)) {
-                cfg.fan_max_rpm = Some(max);
+                edit(cfg, |c| c.fan_max_rpm = Some(max));
                 *changed = true;
             }
             self.result = format!("{} - CPU: {}, GPU: {}", tr(lang, "Measured"), max[0], max[1]);
@@ -706,6 +728,14 @@ impl FansWindow {
 }
 
 // ---- small helpers ------------------------------------------------------------------
+
+/// Saves the fields `f` sets and refreshes `cfg` from the file (see
+/// [`crate::tray::edit_config`]).
+fn edit(cfg: &mut AppConfig, f: impl FnMut(&mut AppConfig)) {
+    if let Err(e) = crate::tray::edit_config(cfg, f) {
+        tracing::warn!("cannot save settings: {e}");
+    }
+}
 
 fn title_row(ui: &mut egui::Ui, icon: Icon, text: &str) {
     let p = pal();
@@ -830,7 +860,10 @@ impl eframe::App for FansApp {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !busy {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        // Follow changes made by the main window or the tray menu.
+        // Follow changes made by the main window or the tray menu. Not while
+        // a curve point is dragged: a mode switched meanwhile would swap the
+        // curves being edited. The save on release writes only those curves,
+        // so the switch is kept and shown right after.
         if self.checked.elapsed() > Duration::from_millis(200) && !self.window.dragging() {
             self.checked = Instant::now();
             let m = config_mtime();
@@ -842,11 +875,11 @@ impl eframe::App for FansApp {
             // Theme from the settings or, on "Windows", the system.
             theme::follow(ctx, &self.cfg.ui_mode, &mut self.dark, MARK_PROP);
         }
+        // Changes are saved as they are made; `cfg` is then the file's
+        // current settings.
         if self.window.show(ctx, &mut self.cfg, self.lang, &self.worker) {
-            if let Err(e) = self.cfg.save() {
-                tracing::warn!("cannot save settings: {e}");
-            }
             self.modified = config_mtime();
+            self.lang = Lang::resolve(&self.cfg.language);
             crate::tray::notify_config_changed();
         }
         ctx.request_repaint_after(Duration::from_millis(200));

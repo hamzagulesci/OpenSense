@@ -9,6 +9,7 @@ pub mod cpu;
 pub mod gpu_load;
 pub mod gpu_name;
 pub mod oem;
+pub mod originals;
 pub mod power;
 pub mod privilege;
 pub mod tweaks;

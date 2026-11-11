@@ -61,11 +61,15 @@ impl UpdatesApp {
             let r = updates::latest();
             *s.lock().unwrap() = r.clone().map_or(State::Offline, State::Latest);
             if let Some(r) = r {
-                let mut cfg = AppConfig::load();
-                cfg.latest_version = Some(r.version);
-                cfg.update_checked = Some(updates::now_secs());
-                let _ = cfg.save();
-                // Otherwise the tray's next save writes its older copy back.
+                let checked = updates::now_secs();
+                let saved = AppConfig::update(|c| {
+                    c.latest_version = Some(r.version);
+                    c.update_checked = Some(checked);
+                });
+                if let Err(e) = saved {
+                    tracing::warn!("cannot save settings: {e}");
+                }
+                // The other processes pick the new version up.
                 crate::tray::notify_config_changed();
             }
             *n.lock().unwrap() = updates::nvidia_driver();

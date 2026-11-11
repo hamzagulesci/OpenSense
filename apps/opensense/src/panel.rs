@@ -358,17 +358,26 @@ impl QuickPanel {
         let _ = self.worker.tx.send(c);
     }
 
-    fn save(&mut self) {
-        if let Err(e) = self.cfg.save() {
+    /// Saves the fields `edit` sets (see [`crate::tray::edit_config`]); the
+    /// panel's copy becomes the file's current settings.
+    fn edit(&mut self, edit: impl FnMut(&mut AppConfig)) {
+        if let Err(e) = crate::tray::edit_config(&mut self.cfg, edit) {
             self.error = Some(format!("{}: {e}", self.t("Could not save settings")));
         }
         self.modified = crate::fans_window::config_mtime();
+        self.lang = Lang::resolve(&self.cfg.language);
         crate::tray::notify_config_changed();
     }
 
     fn set_mode(&mut self, key: &str) {
-        crate::modes::switch(&mut self.cfg, key, &self.worker);
-        self.save();
+        self.edit(|c| crate::modes::select(c, key));
+        crate::modes::activate(&self.cfg, key, &self.worker);
+    }
+
+    /// Fan speeds in RPM or percent (click on a section title).
+    fn toggle_fan_rpm(&mut self) {
+        let on = !self.cfg.fan_rpm;
+        self.edit(|c| c.fan_rpm = on);
     }
 
     fn temp(&self, c: Option<u16>) -> Option<String> {
@@ -553,11 +562,13 @@ impl QuickPanel {
             }
             Some(slot) => {
                 let Some(v) = slot.lock().unwrap().take() else { return };
-                self.cfg.update_checked = Some(crate::updates::now_secs());
-                if !v.is_empty() {
-                    self.cfg.latest_version = Some(v);
-                }
-                self.save();
+                let checked = crate::updates::now_secs();
+                self.edit(|c| {
+                    c.update_checked = Some(checked);
+                    if !v.is_empty() {
+                        c.latest_version = Some(v.clone());
+                    }
+                });
             }
         }
     }
@@ -676,8 +687,7 @@ impl QuickPanel {
             let title = format!("{}: {name}{}", self.t("Mode"), if curve { "+" } else { "" });
             let right = self.sensor_text("CPU", r.cpu_temp, r.cpu_fan_rpm);
             if ui::section_title(ui, Icon::Gauge, &title, &right).is_some_and(|r| r.clicked()) {
-                self.cfg.fan_rpm = !self.cfg.fan_rpm;
-                self.save();
+                self.toggle_fan_rpm();
             }
             ui.add_space(4.0);
             let cells = ui::grid(ui, 4, 64.0);
@@ -731,8 +741,7 @@ impl QuickPanel {
             // No MUX: keep the GPU readings visible under the mode row.
             section(ui, 0.0, 6.0, |ui| {
                 if ui::section_title(ui, Icon::VideoCard, self.t("GPU"), &right).is_some_and(|r| r.clicked()) {
-                    self.cfg.fan_rpm = !self.cfg.fan_rpm;
-                    self.save();
+                    self.toggle_fan_rpm();
                 }
             });
             return;
@@ -745,8 +754,7 @@ impl QuickPanel {
                 title = format!("{title} → {} ({})", self.t(state(p)), self.t("restart"));
             }
             if ui::section_title(ui, Icon::VideoCard, &title, &right).is_some_and(|r| r.clicked()) {
-                self.cfg.fan_rpm = !self.cfg.fan_rpm;
-                self.save();
+                self.toggle_fan_rpm();
             }
             ui.add_space(4.0);
             let cells = ui::grid(ui, 4, 64.0);
@@ -840,8 +848,7 @@ impl QuickPanel {
                 .on_hover_text(self.t("In-game overlay (Ctrl + Shift + Alt + O)"))
                 .clicked()
             {
-                self.cfg.overlay = !on;
-                self.save();
+                self.edit(|c| c.overlay = !on);
             }
             ui.add_space(4.0);
             let cells = ui::grid(ui, 3, 26.0);
@@ -909,12 +916,14 @@ impl QuickPanel {
         });
     }
 
+    /// Sends the lighting edited in the panel's copy and saves it.
     fn apply_lighting(&mut self) {
         if self.cfg.lighting.brightness_level <= 1 {
             self.cfg.lighting.brightness_level = 5;
         }
         self.send(crate::apply::lighting(&self.cfg.lighting));
-        self.save();
+        let lighting = self.cfg.lighting.clone();
+        self.edit(|c| c.lighting.clone_from(&lighting));
     }
 
     fn set_keyboard_color(&mut self, c: Color32) {
@@ -1021,8 +1030,8 @@ impl QuickPanel {
         section(ui, 7.5, 0.0, |ui| {
             let title = format!("{}: {shown}%", self.t("Battery Charge Limit"));
             if ui::section_title(ui, Icon::Battery, &title, &right).is_some_and(|r| r.clicked()) {
-                self.cfg.charge_watt = !self.cfg.charge_watt;
-                self.save();
+                let on = !self.cfg.charge_watt;
+                self.edit(|c| c.charge_watt = on);
             }
             ui.add_space(4.0);
             let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), egui::Sense::hover());
@@ -1040,24 +1049,24 @@ impl QuickPanel {
             });
             if let Some(v) = out.commit {
                 let t = v as u8;
-                self.cfg.set_charge_target(t);
-                self.cfg.charge_full = false;
                 if let Some(on) = crate::apply::charge_cap_for(t, power.battery_percent, b.limit_active) {
                     self.send(Command::ChargeLimit(on));
                 }
-                self.save();
+                self.edit(|c| {
+                    c.set_charge_target(t);
+                    c.charge_full = false;
+                });
             }
             let full = self.cfg.charge_full;
             let resp = ui::pill(ui, pill, "full", "100%", full, theme::STANDARD);
             self.hover_full = resp.hovered();
             if resp.clicked() {
-                self.cfg.charge_full = !full;
-                if self.cfg.charge_full {
+                if !full {
                     self.send(Command::ChargeLimit(false));
                 } else if let Some(on) = crate::apply::charge_cap_for(saved, power.battery_percent, b.limit_active) {
                     self.send(Command::ChargeLimit(on));
                 }
-                self.save();
+                self.edit(|c| c.charge_full = !full);
             }
         });
     }

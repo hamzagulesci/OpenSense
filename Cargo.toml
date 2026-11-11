@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 license = "MIT"
 # `u64::is_multiple_of` (1.87) and `slice::as_chunks` (1.88).

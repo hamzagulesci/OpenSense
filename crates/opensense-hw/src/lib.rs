@@ -25,6 +25,8 @@ pub enum HwError {
     Wmi(String),
     #[error("firmware rejected {method} (status {status:#x})")]
     Firmware { method: &'static str, status: u32 },
+    #[error("{0} reported success but the setting did not change")]
+    NotApplied(&'static str),
     #[error("{0} has an incompatible parameter shape")]
     Shape(&'static str),
     #[error("no hardware transport available on this platform")]

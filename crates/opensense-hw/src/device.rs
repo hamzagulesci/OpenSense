@@ -270,6 +270,9 @@ impl NitroDevice {
     }
 
     /// Turns the 80 % charge limit (Acer "health mode") on or off.
+    ///
+    /// Succeeds only when the limit reads back as requested: some firmware
+    /// answers without a `uReturn` status, so the status alone is not proof.
     pub fn set_charge_limit(&self, on: bool) -> Result<(), HwError> {
         let out = self.transport.call_raw(
             battery::CLASS,
@@ -282,10 +285,19 @@ impl NitroDevice {
             ],
             &["uReturn"],
         )?;
-        match out.first().and_then(WmiValue::as_int) {
-            Some(0) | None => Ok(()),
-            Some(status) => Err(HwError::Firmware { method: battery::SET_CONTROL, status }),
+        if let Some(status) = out.first().and_then(WmiValue::as_int).filter(|&s| s != 0) {
+            return Err(HwError::Firmware { method: battery::SET_CONTROL, status });
         }
+        // Give slow firmware one short second chance before calling it failed.
+        for attempt in 0..2 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+            if self.battery_health()?.limit_active == on {
+                return Ok(());
+            }
+        }
+        Err(HwError::NotApplied(battery::SET_CONTROL))
     }
 
     // ---- keyboard lighting ---------------------------------------------
@@ -383,6 +395,67 @@ mod tests {
         assert_eq!(calls[4], (M::SetGamingRgbKb, 0x04));
         assert_eq!(calls[5], (M::SetGamingRgbKb, 0x08));
         assert_eq!(calls.len(), 6);
+    }
+
+    /// Battery firmware that answers the write without a `uReturn` and
+    /// applies it only when `applies` is set.
+    struct SilentBattery {
+        applies: bool,
+        active: std::sync::Mutex<bool>,
+    }
+    impl GamingTransport for SilentBattery {
+        fn name(&self) -> &'static str {
+            "silent-battery"
+        }
+        fn set_u64(&self, _: M, _: u64) -> Result<u32, HwError> {
+            Ok(0)
+        }
+        fn get_u32(&self, _: M, _: u32) -> Result<u64, HwError> {
+            Ok(0)
+        }
+        fn set_bytes(&self, _: M, _: &[u8]) -> Result<u32, HwError> {
+            Ok(0)
+        }
+        fn get_bytes(&self, _: M, _: u32) -> Result<Vec<u8>, HwError> {
+            Ok(vec![0; 16])
+        }
+        fn call_raw(
+            &self,
+            _class: &'static str,
+            method: &'static str,
+            inputs: &[(&'static str, WmiValue)],
+            _outputs: &[&'static str],
+        ) -> Result<Vec<WmiValue>, HwError> {
+            let mut active = self.active.lock().unwrap();
+            if method == battery::SET_CONTROL {
+                if self.applies {
+                    *active = inputs.iter().any(|(n, v)| *n == "uFunctionStatus" && v.as_int() == Some(1));
+                }
+                return Ok(Vec::new());
+            }
+            Ok(vec![WmiValue::Int(3), WmiValue::Bytes(vec![u8::from(*active), 0, 0, 0, 0])])
+        }
+    }
+
+    #[test]
+    fn charge_limit_success_means_read_back() {
+        let dev = |applies| {
+            NitroDevice::new(Box::new(SilentBattery { applies, active: Default::default() }), DeviceProfile::default())
+        };
+        dev(true).set_charge_limit(true).unwrap();
+        assert!(matches!(dev(false).set_charge_limit(true), Err(HwError::NotApplied(_))));
+        // Already in the requested state: nothing to change, so it is fine.
+        dev(false).set_charge_limit(false).unwrap();
+    }
+
+    #[test]
+    fn mock_charge_limit_round_trip() {
+        let mock = MockTransport::default();
+        let dev = NitroDevice::new(Box::new(mock), DeviceProfile::default());
+        dev.set_charge_limit(true).unwrap();
+        assert!(dev.battery_health().unwrap().limit_active);
+        dev.set_charge_limit(false).unwrap();
+        assert!(!dev.battery_health().unwrap().limit_active);
     }
 
     #[test]

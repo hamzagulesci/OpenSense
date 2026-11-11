@@ -275,6 +275,7 @@ pub fn tr(lang: Lang, s: &'static str) -> &'static str {
         "Scan" => "Tara",
         "Save a report of every firmware value and open it" => "Tüm firmware değerlerinin raporunu kaydet ve aç",
         "Disable PCIe Link State Management (plugged in)" => "PCIe bağlantı durumu yönetimini kapat (adaptörde)",
+        "Could not change the PCIe setting:" => "PCIe ayarı değiştirilemedi:",
         "Disable networking in Modern Standby" => "Modern Bekleme'de ağı kapat",
         "Keep app window always on top" => "Uygulama penceresini her zaman üstte tut",
         "Auto Toggle Clamshell Mode" => "Kapak kapalı modunu otomatik aç/kapat",

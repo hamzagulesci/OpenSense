@@ -349,6 +349,10 @@ mod modes {
         if same {
             return Ok(());
         }
+        // Remember the plan's own value for `opensense --restore-system`.
+        if ac != u32::MAX && dc != u32::MAX {
+            crate::originals::remember_cpu_boost(scheme.to_u128(), (ac, dc));
+        }
         unsafe {
             check(PowerWriteACValueIndex(None, &scheme, Some(&SUB_PROCESSOR), Some(&BOOST_MODE), v).0, "write AC")?;
             check(PowerWriteDCValueIndex(None, &scheme, Some(&SUB_PROCESSOR), Some(&BOOST_MODE), v), "write DC")?;

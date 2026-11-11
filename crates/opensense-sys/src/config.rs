@@ -2,7 +2,7 @@
 //!
 //! Everything is kept per user in one human-readable file.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -186,6 +186,9 @@ pub struct AppConfig {
     pub kb_timeout_battery: u32,
     /// Disable PCIe link power saving while plugged in.
     pub aspm_off: bool,
+    /// Plugged-in PCIe link power setting the power plan had before
+    /// `aspm_off` turned it off; restored when the option is turned off.
+    pub aspm_previous: Option<u32>,
     /// Disable networking during Modern Standby.
     pub standby_network_off: bool,
     /// Keep the laptop awake with the lid closed when plugged in and an
@@ -214,6 +217,9 @@ pub struct AppConfig {
     pub overlay_pos: Option<[i32; 2]>,
     pub overlay_scale: u16,
     pub overlay_alpha: u8,
+    /// Start type each Acer service had before OpenSense stopped it
+    /// (see `tweaks::set_services`).
+    pub service_start_types: std::collections::BTreeMap<String, u32>,
 }
 
 impl Default for AppConfig {
@@ -245,6 +251,7 @@ impl Default for AppConfig {
             kb_timeout_ac: 0,
             kb_timeout_battery: 60,
             aspm_off: false,
+            aspm_previous: None,
             standby_network_off: false,
             clamshell: false,
             clamshell_default_lid: None,
@@ -260,6 +267,7 @@ impl Default for AppConfig {
             overlay_pos: None,
             overlay_scale: 100,
             overlay_alpha: 128,
+            service_start_types: Default::default(),
         }
     }
 }
@@ -269,18 +277,59 @@ impl AppConfig {
         directories::ProjectDirs::from("", "", "OpenSense").map(|d| d.config_dir().join("config.toml"))
     }
 
-    /// Loads the config, falling back to defaults when missing or invalid.
+    /// Loads the config. A missing file gives the defaults; an invalid field
+    /// falls back to its default (logged) while the rest is kept, and a copy
+    /// of the file is saved as `config.toml.bad` whenever anything was
+    /// dropped.
     pub fn load() -> Self {
-        let Some(path) = Self::path() else { return Self::default() };
+        Self::path().map_or_else(Self::default, |p| Self::load_from(&p))
+    }
+
+    /// Loads the file, changes it with `f` and saves it, all under the
+    /// cross-process write lock, so only the fields `f` touches change and
+    /// a concurrent save from another window is not overwritten with a
+    /// stale copy. Returns the saved config.
+    pub fn update(f: impl FnOnce(&mut AppConfig)) -> Result<AppConfig, SysError> {
+        let path = Self::path().ok_or_else(|| SysError::Config("no config directory".into()))?;
+        Self::update_at(&path, f)
+    }
+
+    fn update_at(path: &Path, f: impl FnOnce(&mut AppConfig)) -> Result<AppConfig, SysError> {
+        let _lock = WriteLock::acquire();
+        let mut cfg = Self::load_from(path);
+        f(&mut cfg);
+        cfg.write_to(path)?;
+        Ok(cfg)
+    }
+
+    /// Parses config text, keeping every valid field. Returns the config and
+    /// the dotted names of the fields that were invalid and replaced by
+    /// their defaults. Fails only when the text is not TOML at all.
+    pub fn parse_lenient(text: &str) -> Result<(Self, Vec<String>), toml::de::Error> {
+        if let Ok(cfg) = toml::from_str(text) {
+            return Ok((cfg, Vec::new()));
+        }
+        let file: toml::Table = toml::from_str(text)?;
+        // Every struct is `#[serde(default)]`, so an empty table is the
+        // default config; add the file's fields one by one and keep each
+        // one that still deserializes.
+        let mut root = toml::Table::new();
+        let mut dropped = Vec::new();
+        merge_valid(&mut root, &mut Vec::new(), file, &mut dropped);
+        let cfg = toml::Value::Table(root).try_into().unwrap_or_default();
+        Ok((cfg, dropped))
+    }
+
+    fn load_from(path: &Path) -> Self {
         // Another OpenSense process may be replacing the file right now
         // (sharing violation); defaults returned for that would later be
         // saved over the real settings, so retry before giving up.
-        let mut read = std::fs::read_to_string(&path);
+        let mut read = std::fs::read_to_string(path);
         for _ in 0..5 {
             match &read {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                     std::thread::sleep(std::time::Duration::from_millis(20));
-                    read = std::fs::read_to_string(&path);
+                    read = std::fs::read_to_string(path);
                 }
                 _ => break,
             }
@@ -289,13 +338,21 @@ impl AppConfig {
             // Keep the broken file for the user instead of overwriting it.
             let backup = path.with_extension("toml.bad");
             tracing::warn!("invalid {}: {why}; saved a copy as {}", path.display(), backup.display());
-            let _ = std::fs::copy(&path, backup);
+            let _ = std::fs::copy(path, backup);
         };
         match read {
-            Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
-                keep_copy(&e);
-                Self::default()
-            }),
+            Ok(text) => match Self::parse_lenient(&text) {
+                Ok((cfg, dropped)) => {
+                    if !dropped.is_empty() {
+                        keep_copy(&format_args!("reset to default: {}", dropped.join(", ")));
+                    }
+                    cfg
+                }
+                Err(e) => {
+                    keep_copy(&e);
+                    Self::default()
+                }
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(e) => {
                 keep_copy(&e);
@@ -314,8 +371,16 @@ impl AppConfig {
         self.charge_limit = None;
     }
 
+    /// Saves this whole config. Prefer [`AppConfig::update`] for a change
+    /// made from a copy that may be stale.
     pub fn save(&self) -> Result<(), SysError> {
         let path = Self::path().ok_or_else(|| SysError::Config("no config directory".into()))?;
+        let _lock = WriteLock::acquire();
+        self.write_to(&path)
+    }
+
+    /// Writes the file; the caller holds the [`WriteLock`].
+    fn write_to(&self, path: &Path) -> Result<(), SysError> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -323,7 +388,6 @@ impl AppConfig {
         // Several OpenSense processes save this file: one writer at a
         // time, each with its own temp file, flushed before the rename so
         // a crash or power loss leaves the old or the new file, never half.
-        let _lock = WriteLock::acquire();
         let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
         let written = (|| {
             use std::io::Write;
@@ -331,11 +395,57 @@ impl AppConfig {
             f.write_all(text.as_bytes())?;
             f.sync_all()
         })();
-        if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, &path)) {
+        if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.into());
         }
         Ok(())
+    }
+}
+
+/// The table at `path` inside `root` (created by [`merge_valid`] before it
+/// descends).
+fn table_at<'a>(root: &'a mut toml::Table, path: &[String]) -> &'a mut toml::Table {
+    path.iter().fold(root, |t, k| match t.get_mut(k) {
+        Some(toml::Value::Table(sub)) => sub,
+        _ => unreachable!("merge_valid creates every table it descends into"),
+    })
+}
+
+/// Adds the fields of `incoming` (the file's table at `path`) to `root` one
+/// at a time, keeping each one with which `root` still deserializes as an
+/// [`AppConfig`]. An invalid table is merged field by field, so one bad
+/// value only drops itself; dropped names are added to `dropped`.
+fn merge_valid(root: &mut toml::Table, path: &mut Vec<String>, incoming: toml::Table, dropped: &mut Vec<String>) {
+    let valid = |root: &toml::Table| toml::Value::Table(root.clone()).try_into::<AppConfig>().is_ok();
+    for (key, value) in incoming {
+        let prev = table_at(root, path).insert(key.clone(), value.clone());
+        if valid(root) {
+            continue;
+        }
+        let here = table_at(root, path);
+        match prev {
+            Some(p) => here.insert(key.clone(), p),
+            None => here.remove(&key),
+        };
+        let name = path.iter().chain(Some(&key)).cloned().collect::<Vec<_>>().join(".");
+        let toml::Value::Table(sub) = value else {
+            dropped.push(name);
+            continue;
+        };
+        // Descend: start from an empty table (all defaults) at this key.
+        let here = table_at(root, path);
+        if !matches!(here.get(&key), Some(toml::Value::Table(_))) {
+            here.insert(key.clone(), toml::Value::Table(toml::Table::new()));
+            if !valid(root) {
+                table_at(root, path).remove(&key);
+                dropped.push(name);
+                continue;
+            }
+        }
+        path.push(key);
+        merge_valid(root, path, sub, dropped);
+        path.pop();
     }
 }
 
@@ -387,5 +497,92 @@ mod tests {
         assert_eq!(partial.poll_ms, 2000);
         assert_eq!(partial.fan.mode, FanModeCfg::Max);
         assert_eq!(partial.fan.cpu_percent, 50);
+    }
+
+    #[test]
+    fn invalid_field_only_resets_itself() {
+        let text = r##"
+poll_ms = 2000
+current_mode = "custom1"
+temp_unit = "kelvin"
+history_len = -5
+
+[fan]
+mode = "turbo"
+cpu_percent = 70
+
+[lighting]
+zones = ["#00FF00", "#00FF00", "#00FF00"]
+effect = "neon"
+
+[profiles.custom1]
+name = "Mine"
+base = "extreme"
+cpu_boost = 900
+
+[profiles.quiet]
+apply_curve = true
+"##;
+        let (c, mut dropped) = AppConfig::parse_lenient(text).unwrap();
+        dropped.sort();
+        assert_eq!(dropped, ["fan.mode", "history_len", "lighting.zones", "profiles.custom1.cpu_boost", "temp_unit"]);
+        let d = AppConfig::default();
+        assert_eq!(c.poll_ms, 2000);
+        assert_eq!(c.current_mode.as_deref(), Some("custom1"));
+        assert_eq!(c.temp_unit, d.temp_unit);
+        assert_eq!(c.history_len, d.history_len);
+        assert_eq!(c.fan.mode, FanModeCfg::Auto);
+        assert_eq!(c.fan.cpu_percent, 70);
+        assert_eq!(c.lighting.zones, d.lighting.zones);
+        assert_eq!(c.lighting.effect, "neon");
+        let p = &c.profiles["custom1"];
+        assert_eq!((p.name.as_str(), p.base.as_str(), p.cpu_boost), ("Mine", "extreme", None));
+        assert!(c.profiles["quiet"].apply_curve);
+    }
+
+    #[test]
+    fn whole_table_of_wrong_type_is_dropped() {
+        let (c, dropped) = AppConfig::parse_lenient("fan = 3\npoll_ms = 500\n").unwrap();
+        assert_eq!(dropped, ["fan"]);
+        assert_eq!((c.fan, c.poll_ms), (FanConfig::default(), 500));
+        assert!(AppConfig::parse_lenient("this is = = not toml").is_err());
+    }
+
+    fn temp_config(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("opensense-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("config.toml")
+    }
+
+    #[test]
+    fn load_keeps_bad_copy_only_when_something_was_dropped() {
+        let path = temp_config("bad-copy");
+        let bad = path.with_extension("toml.bad");
+        std::fs::write(&path, "poll_ms = 1500\n").unwrap();
+        assert_eq!(AppConfig::load_from(&path).poll_ms, 1500);
+        assert!(!bad.exists());
+        std::fs::write(&path, "poll_ms = 1500\ntheme = 7\n").unwrap();
+        let c = AppConfig::load_from(&path);
+        assert_eq!((c.poll_ms, c.theme.as_str()), (1500, "dark"));
+        assert_eq!(std::fs::read_to_string(&bad).unwrap(), "poll_ms = 1500\ntheme = 7\n");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn update_changes_only_what_it_touches() {
+        let path = temp_config("update");
+        // Missing file: starts from the defaults.
+        let c = AppConfig::update_at(&path, |c| c.poll_ms = 1234).unwrap();
+        assert_eq!(c.poll_ms, 1234);
+        // Another process saves a different field in the meantime...
+        let mut other = AppConfig::load_from(&path);
+        other.theme = "light".into();
+        other.write_to(&path).unwrap();
+        // ...and an update from a stale copy's point of view keeps it.
+        let c = AppConfig::update_at(&path, |c| c.fan.cpu_percent = 80).unwrap();
+        assert_eq!((c.poll_ms, c.theme.as_str(), c.fan.cpu_percent), (1234, "light", 80));
+        assert_eq!(AppConfig::load_from(&path), c);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

@@ -70,12 +70,18 @@ Filename: "{app}\opensense.exe"; Parameters: "--set-language {language}"; Flags:
 Filename: "{app}\opensense.exe"; Parameters: "--autostart-on"; Flags: runhidden waituntilterminated; Tasks: autostart
 Filename: "{app}\opensense.exe"; Parameters: "--autostart-off"; Flags: runhidden waituntilterminated; Tasks: not autostart
 Filename: "{app}\opensense.exe"; Description: "{cm:LaunchNow}"; Flags: nowait postinstall skipifsilent
+; A silent upgrade (/SILENT, /VERYSILENT) skips the entry above: start the
+; tray agent again if it was running before the setup stopped it.
+Filename: "{app}\opensense.exe"; Parameters: "--tray"; Flags: nowait; Check: RelaunchTray
 
 [UninstallRun]
 ; A clean quit first: the agent restores the fans before it exits.
 Filename: "{app}\opensense.exe"; Parameters: "--quit"; Flags: runhidden waituntilterminated; RunOnceId: "QuitApp"
 Filename: "{app}\opensense.exe"; Parameters: "--autostart-off"; Flags: runhidden waituntilterminated; RunOnceId: "Autostart"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM opensense.exe"; Flags: runhidden waituntilterminated; RunOnceId: "StopApp"
+; With nothing left running: undo the power plan, lid, NVIDIA clock and
+; Acer service changes (before the files are removed).
+Filename: "{app}\opensense.exe"; Parameters: "--restore-system"; Flags: runhidden waituntilterminated; RunOnceId: "RestoreSystem"
 
 [UninstallDelete]
 ; Left behind by the in-app updater.
@@ -83,6 +89,15 @@ Type: files; Name: "{app}\*.old"
 Type: files; Name: "{app}\*.old.*"
 
 [Code]
+var
+  TrayWasRunning: Boolean;
+
+// Silent setup only: start the tray agent again after an upgrade.
+function RelaunchTray: Boolean;
+begin
+  Result := WizardSilent and TrayWasRunning;
+end;
+
 // Stop a running OpenSense (tray agent and windows) so its files can be
 // replaced. A clean quit first lets the agent restore the fans; taskkill
 // only removes what is left (open windows, an older version).
@@ -90,6 +105,8 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   Code: Integer;
 begin
+  // The agent holds this mutex in the user's session while it runs.
+  TrayWasRunning := CheckForMutexes('Local\OpenSense.TrayAgent');
   if FileExists(ExpandConstant('{app}\opensense.exe')) then
     Exec(ExpandConstant('{app}\opensense.exe'), '--quit', '', SW_HIDE, ewWaitUntilTerminated, Code);
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM opensense.exe', '', SW_HIDE, ewWaitUntilTerminated, Code);

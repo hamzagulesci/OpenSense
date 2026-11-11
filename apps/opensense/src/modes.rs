@@ -172,20 +172,40 @@ pub fn commands(cfg: &AppConfig, key: &str) -> Vec<Command> {
     out
 }
 
-/// Switches to a mode: stores it, sends the firmware commands and applies
-/// the Windows settings. The caller saves the config.
-pub fn switch(cfg: &mut AppConfig, key: &str, worker: &WorkerHandle) {
+/// Stores a mode as the current one: the settings a mode switch changes
+/// (`current_mode`, `operation_mode` and possibly `fan.mode`).
+pub fn select(cfg: &mut AppConfig, key: &str) {
     let base = base_of(cfg, key);
     cfg.current_mode = Some(key.to_owned());
     cfg.operation_mode = Some(base.label().to_ascii_lowercase());
     if !profile(cfg, key).apply_curve && base.forces_auto_fan() {
         cfg.fan.mode = FanModeCfg::Auto;
     }
+}
+
+/// Sends the firmware commands of a mode and applies its Windows settings.
+pub fn activate(cfg: &AppConfig, key: &str, worker: &WorkerHandle) {
     for c in commands(cfg, key) {
         let _ = worker.tx.send(c);
     }
-    let p = profile(cfg, key);
+    let (p, base) = (profile(cfg, key), base_of(cfg, key));
     std::thread::spawn(move || apply_windows(&p, base));
+}
+
+/// Switches to a mode: [`select`] and [`activate`]. The caller saves the
+/// fields `select` changed.
+pub fn switch(cfg: &mut AppConfig, key: &str, worker: &WorkerHandle) {
+    select(cfg, key);
+    activate(cfg, key, worker);
+}
+
+/// Changes the settings of a mode. A user mode that is gone (deleted in
+/// another window meanwhile) is left out rather than brought back.
+pub fn edit_profile(cfg: &mut AppConfig, key: &str, f: impl FnOnce(&mut ModeProfile)) {
+    if is_custom(key) && !cfg.profiles.contains_key(key) {
+        return;
+    }
+    f(profile_mut(cfg, key));
 }
 
 // ---- curves ---------------------------------------------------------------------
