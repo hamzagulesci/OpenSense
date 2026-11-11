@@ -1,4 +1,4 @@
-//! Main window (`opensense --panel`), laid out like G-Helper's: Mode, GPU
+//! Main window (`opensense --panel`): Mode, GPU
 //! Mode, Laptop Keyboard and Battery sections stacked in one fixed-width
 //! column, then the startup row, version link and footer buttons.
 //!
@@ -623,7 +623,7 @@ impl eframe::App for QuickPanel {
 
 // ---- sections -------------------------------------------------------------------
 
-/// Runs `body` inside a full-width block with G-Helper's section padding.
+/// Runs `body` inside a full-width block with the section padding.
 fn section(ui: &mut egui::Ui, top: f32, bottom: f32, body: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::none().inner_margin(egui::Margin { left: SIDE, right: SIDE, top, bottom }).show(ui, |ui| {
         ui.set_width(ui.available_width());

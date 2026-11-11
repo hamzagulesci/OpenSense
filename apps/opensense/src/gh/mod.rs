@@ -1,4 +1,4 @@
-//! G-Helper-style look: theme, icons and custom controls shared by the
+//! Shared look: theme, icons and custom controls shared by the
 //! main window and its child windows.
 
 pub mod icons;

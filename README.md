@@ -32,7 +32,7 @@ built to use as few resources as possible.
 
 | Area | What you can do |
 |---|---|
-| **Main window** | Compact window by the clock, like G-Helper: Mode, GPU Mode, Laptop Keyboard and Battery sections, live CPU/GPU temperatures and fan speeds |
+| **Main window** | Compact window by the clock: Mode, GPU Mode, Laptop Keyboard and Battery sections, live CPU/GPU temperatures and fan speeds |
 | **Performance modes** | Quiet, Default and Extreme plus your own modes based on them; each mode has its own fan curves, Windows power mode and CPU boost |
 | **Fans + Power** | Drag-to-edit CPU and GPU fan curves (temperature to fan speed), Windows power mode, CPU boost, NVIDIA clock limit, fan calibration |
 | **GPU mode** | Standard (hybrid) / Ultimate (discrete only) MUX switch with a restart prompt |
@@ -192,7 +192,7 @@ az kaynak kullanacak şekilde tasarlanmıştır.
 
 | Alan | Neler yapılabilir |
 |---|---|
-| **Ana pencere** | G-Helper gibi saatin yanında açılan kompakt pencere: Mod, GPU Modu, Klavye ve Pil bölümleri, canlı CPU/GPU sıcaklığı ve fan hızları |
+| **Ana pencere** | Saatin yanında açılan kompakt pencere: Mod, GPU Modu, Klavye ve Pil bölümleri, canlı CPU/GPU sıcaklığı ve fan hızları |
 | **Performans modları** | Sessiz, Varsayılan ve Ekstrem ile bunlara dayalı kendi modlarınız; her modun kendi fan eğrileri, Windows güç modu ve CPU Boost ayarı |
 | **Fanlar + Güç** | Sürükleyerek düzenlenen CPU ve GPU fan eğrileri (sıcaklığa göre fan hızı), Windows güç modu, CPU Boost, NVIDIA saat sınırı, fan kalibrasyonu |
 | **GPU modu** | Standart (hibrit) / Ultimate (yalnız harici) MUX geçişi, yeniden başlatma sorusuyla |

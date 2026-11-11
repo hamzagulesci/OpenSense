@@ -198,7 +198,7 @@ fn main() -> eframe::Result<()> {
             |cc| Box::new(updates_window::UpdatesApp::new(cc)),
         );
     }
-    // Direct launch: like G-Helper, the main window plus the tray agent.
+    // Direct launch: the main window plus the tray agent.
     let mock = args.transport == TransportKind::Mock;
     if !mock && !args.relaunched && !opensense_sys::privilege::is_elevated() {
         match opensense_sys::privilege::relaunch_elevated("--relaunched") {
