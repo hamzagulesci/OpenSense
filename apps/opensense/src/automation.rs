@@ -76,6 +76,73 @@ impl Hotkey {
     }
 }
 
+/// Settings changes recorded field by field, to be applied again to what
+/// the settings file holds when they are saved.
+#[derive(Default)]
+pub struct Edits(Vec<Edit>);
+
+/// One recorded settings change.
+type Edit = Box<dyn Fn(&mut AppConfig)>;
+
+impl Edits {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Applies every recorded change to `cfg`, in order.
+    pub fn apply(&self, cfg: &mut AppConfig) {
+        for edit in &self.0 {
+            edit(cfg);
+        }
+    }
+}
+
+/// The tray agent's settings as the automation sees them. They can be read
+/// freely (`Deref`), but the only way to change them is [`Tracked::edit`],
+/// which applies the change at once and records it in [`Edits`]. The tray
+/// then saves exactly those changes on top of the file, so nothing the
+/// automation sets can be left out of the save (and nothing else is written).
+pub struct Tracked<'a> {
+    cfg: &'a mut AppConfig,
+    edits: Edits,
+}
+
+impl<'a> Tracked<'a> {
+    pub fn new(cfg: &'a mut AppConfig) -> Self {
+        Self { cfg, edits: Edits::default() }
+    }
+
+    /// Changes the settings. `edit` should set the fields it changes to
+    /// values (not toggle what is there), since it runs again on the file's
+    /// settings when they are saved.
+    pub fn edit(&mut self, edit: impl Fn(&mut AppConfig) + 'static) {
+        edit(self.cfg);
+        self.edits.0.push(Box::new(edit));
+    }
+
+    /// The changes made, for saving.
+    pub fn into_edits(self) -> Edits {
+        self.edits
+    }
+}
+
+impl std::ops::Deref for Tracked<'_> {
+    type Target = AppConfig;
+
+    fn deref(&self) -> &AppConfig {
+        self.cfg
+    }
+}
+
+/// Keyboard backlight level after a brightness shortcut (1 = off .. 5).
+fn backlight_step(level: u8, up: bool) -> u8 {
+    if up {
+        (level + 1).min(5)
+    } else {
+        level.saturating_sub(1).max(1)
+    }
+}
+
 pub struct Automation {
     pub osd: Osd,
     registered: bool,
@@ -130,13 +197,10 @@ impl Automation {
         }
     }
 
-    /// Runs a shortcut. Returns true when the config changed (save it).
-    pub fn hotkey(&mut self, h: Hotkey, cfg: &mut AppConfig, worker: &WorkerHandle, lang: Lang, mock: bool) -> bool {
+    /// Runs a shortcut. Settings it changes are recorded in `cfg` (save them).
+    pub fn hotkey(&mut self, h: Hotkey, cfg: &mut Tracked, worker: &WorkerHandle, lang: Lang, mock: bool) {
         match h {
-            Hotkey::ToggleWindow => {
-                crate::tray::toggle_window(mock);
-                false
-            }
+            Hotkey::ToggleWindow => crate::tray::toggle_window(mock),
             Hotkey::CycleMode | Hotkey::CycleModeBack => {
                 let list = crate::modes::ordered(cfg);
                 let cur = crate::modes::current_key(cfg);
@@ -148,9 +212,8 @@ impl Automation {
                 let next = (1..=n)
                     .map(|i| list[(start + step * i) % n].clone())
                     .find(|k| full_power || crate::modes::base_of(cfg, k) != OperationMode::Extreme);
-                match next {
-                    Some(k) => self.switch(cfg, &k, worker, lang),
-                    None => false,
+                if let Some(k) = next {
+                    self.switch(cfg, &k, worker, lang);
                 }
             }
             Hotkey::Quiet | Hotkey::Default | Hotkey::Extreme => {
@@ -161,24 +224,20 @@ impl Automation {
                 };
                 if m.needs_full_power() && !full_power(worker) {
                     self.toast(cfg, tr(lang, "Extreme needs AC power"));
-                    return false;
+                    return;
                 }
-                self.switch(cfg, &m.label().to_ascii_lowercase(), worker, lang)
+                self.switch(cfg, &m.label().to_ascii_lowercase(), worker, lang);
             }
             Hotkey::Overlay => {
-                cfg.overlay = !cfg.overlay;
-                let text = if cfg.overlay { "Overlay On" } else { "Overlay Off" };
-                self.toast(cfg, tr(lang, text));
-                true
+                let on = !cfg.overlay;
+                cfg.edit(move |c| c.overlay = on);
+                self.toast(cfg, tr(lang, if on { "Overlay On" } else { "Overlay Off" }));
             }
             Hotkey::BacklightDown | Hotkey::BacklightUp => {
-                let l = &mut cfg.lighting;
-                let level = if h == Hotkey::BacklightUp {
-                    (l.brightness_level + 1).min(5)
-                } else {
-                    l.brightness_level.saturating_sub(1).max(1)
-                };
-                l.brightness_level = level;
+                let level = backlight_step(cfg.lighting.brightness_level, h == Hotkey::BacklightUp);
+                // Only the brightness: colours or an effect changed in a
+                // window at the same moment are kept.
+                cfg.edit(move |c| c.lighting.brightness_level = level);
                 self.kb_dimmed = false;
                 let _ = worker.tx.send(crate::apply::lighting(&cfg.lighting));
                 let text = if level <= 1 {
@@ -187,17 +246,17 @@ impl Automation {
                     format!("{}%", opensense_proto::lighting::level_to_percent(level))
                 };
                 self.toast(cfg, &text);
-                true
             }
         }
     }
 
-    /// Switches mode with a toast. Returns true (config changed).
-    pub fn switch(&mut self, cfg: &mut AppConfig, key: &str, worker: &WorkerHandle, lang: Lang) -> bool {
-        crate::modes::switch(cfg, key, worker);
+    /// Switches mode with a toast; the fields the switch sets are recorded.
+    pub fn switch(&mut self, cfg: &mut Tracked, key: &str, worker: &WorkerHandle, lang: Lang) {
+        let owned = key.to_owned();
+        cfg.edit(move |c| crate::modes::select(c, &owned));
+        crate::modes::activate(cfg, key, worker);
         let name = crate::modes::display_name(cfg, lang, key);
         self.toast(cfg, &name);
-        true
     }
 
     /// Applies the power tweaks chosen in the Extra window (idempotent).
@@ -213,15 +272,14 @@ impl Automation {
         });
     }
 
-    /// Once a second. Returns true when the config changed (save it).
-    pub fn tick(&mut self, cfg: &mut AppConfig, worker: &WorkerHandle, lang: Lang) -> bool {
+    /// Once a second. Settings it changes are recorded in `cfg` (save them).
+    pub fn tick(&mut self, cfg: &mut Tracked, worker: &WorkerHandle, lang: Lang) {
         self.osd.tick();
         self.ticks += 1;
-        let mut changed = false;
         // Asked from Windows directly: the worker's snapshot reads "on
         // battery" until its first poll, which would look like a power
         // source change (and store the AC mode as the battery mode).
-        let Ok(on_ac) = opensense_sys::power::status().map(|p| p.on_ac) else { return false };
+        let Ok(on_ac) = opensense_sys::power::status().map(|p| p.on_ac) else { return };
         let key = crate::modes::current_key(cfg);
 
         // Remember the mode per power source; restore it when the source
@@ -232,7 +290,7 @@ impl Automation {
                 if let Some(k) = wanted.filter(|k| *k != key && crate::modes::ordered(cfg).contains(k)) {
                     let ok = on_ac || crate::modes::base_of(cfg, &k) != OperationMode::Extreme;
                     if ok {
-                        changed |= self.switch(cfg, &k, worker, lang);
+                        self.switch(cfg, &k, worker, lang);
                     }
                 }
                 self.kb_dimmed = false;
@@ -240,10 +298,14 @@ impl Automation {
             }
             _ => {
                 if self.last_key.as_deref() != Some(key.as_str()) {
-                    let slot = if on_ac { &mut cfg.mode_ac } else { &mut cfg.mode_dc };
+                    let slot = if on_ac { &cfg.mode_ac } else { &cfg.mode_dc };
                     if slot.as_deref() != Some(key.as_str()) {
-                        *slot = Some(key.clone());
-                        changed = true;
+                        let key = Some(key.clone());
+                        if on_ac {
+                            cfg.edit(move |c| c.mode_ac.clone_from(&key));
+                        } else {
+                            cfg.edit(move |c| c.mode_dc.clone_from(&key));
+                        }
                     }
                 }
             }
@@ -284,8 +346,8 @@ impl Automation {
                 if want {
                     if cfg.clamshell_default_lid.is_none() {
                         let current = tweaks::read(setting::LID_ACTION).map(|v| v.0).unwrap_or(1);
-                        cfg.clamshell_default_lid = Some(if current == 0 { 1 } else { current });
-                        changed = true;
+                        let lid = Some(if current == 0 { 1 } else { current });
+                        cfg.edit(move |c| c.clamshell_default_lid = lid);
                     }
                     let _ = tweaks::write(setting::LID_ACTION, Some(0), None);
                 } else {
@@ -294,7 +356,6 @@ impl Automation {
                 self.clamshell_active = want;
             }
         }
-        changed
     }
 
     /// On exit: gives the lid action back if clamshell mode forced it.
@@ -309,4 +370,47 @@ impl Automation {
 fn full_power(worker: &WorkerHandle) -> bool {
     let s = worker.shared.lock();
     s.power.on_ac && s.battery_boost != Some(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backlight_steps_stay_in_range() {
+        assert_eq!(backlight_step(5, true), 5);
+        assert_eq!(backlight_step(3, true), 4);
+        assert_eq!(backlight_step(1, false), 1);
+        assert_eq!(backlight_step(0, false), 1);
+        assert_eq!(backlight_step(4, false), 3);
+    }
+
+    #[test]
+    fn tracked_edits_apply_now_and_replay_field_by_field() {
+        let mut mine = AppConfig::default();
+        let mut t = Tracked::new(&mut mine);
+        t.edit(|c| c.lighting.brightness_level = 2);
+        t.edit(|c| c.overlay = true);
+        assert_eq!(t.lighting.brightness_level, 2);
+        let edits = t.into_edits();
+        assert!(!edits.is_empty());
+        assert!(mine.overlay);
+
+        // Another process changed the colours and the mode meanwhile: the
+        // replay keeps them and sets only what the automation changed.
+        let mut file = AppConfig::default();
+        file.lighting.zones[0] = "#00FF00".into();
+        file.current_mode = Some("quiet".into());
+        edits.apply(&mut file);
+        assert_eq!(file.lighting.brightness_level, 2);
+        assert!(file.overlay);
+        assert_eq!(file.lighting.zones[0], "#00FF00");
+        assert_eq!(file.current_mode.as_deref(), Some("quiet"));
+    }
+
+    #[test]
+    fn no_edits_means_nothing_to_save() {
+        let mut cfg = AppConfig::default();
+        assert!(Tracked::new(&mut cfg).into_edits().is_empty());
+    }
 }

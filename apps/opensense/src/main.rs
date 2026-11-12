@@ -144,8 +144,9 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
     // Used by the uninstaller after `--quit`: undo the Windows settings
-    // OpenSense changed (power plan, lid action, NVIDIA clock lock, Acer
-    // services), then exit.
+    // OpenSense changed (power plan and mode, lid action, NVIDIA clock lock,
+    // Acer services), hand the firmware back in a neutral state (fans Auto,
+    // operation mode Default, charge limit off), then exit.
     if std::env::args().any(|a| a == "--restore-system") {
         restore::run();
         return Ok(());

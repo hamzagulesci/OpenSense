@@ -231,11 +231,21 @@ fn plan_stop(current: u32, saved: Option<u32>) -> (Option<u32>, Option<u32>) {
     (remember, set)
 }
 
-/// What starting a service does: the start type to restore (if it differs
-/// from `current`) and whether to start it. A service that was disabled
-/// before (or is disabled with nothing remembered) is not started.
-fn plan_start(current: u32, saved: Option<u32>) -> (Option<u32>, bool) {
-    let target = saved.unwrap_or(current);
+/// Vendor services that Acer's installers register with automatic start.
+/// Assumed for all of [`ACER_SERVICES`]; not confirmed on every model.
+const INSTALLED_AUTO: [&str; 7] = ACER_SERVICES;
+
+/// What starting the service `name` does: the start type to restore (if it
+/// differs from `current`) and whether to start it. A remembered start type
+/// wins. With nothing remembered, a manual service that Acer installs as
+/// automatic goes back to automatic: OpenSense 0.2.2 lowered it to manual
+/// without remembering the type. A service that was disabled before (or is
+/// disabled with nothing remembered) is not started.
+fn plan_start(name: &str, current: u32, saved: Option<u32>) -> (Option<u32>, bool) {
+    // Service names are case-insensitive in the service control manager.
+    let installed_auto = INSTALLED_AUTO.iter().any(|n| n.eq_ignore_ascii_case(name));
+    let target =
+        saved.unwrap_or(if current == start_type::DEMAND && installed_auto { start_type::AUTO } else { current });
     ((target != current).then_some(target), target != start_type::DISABLED)
 }
 
@@ -358,7 +368,9 @@ pub fn installed_services() -> Vec<&'static str> {
 
 /// Stops or starts the installed vendor services. Stopping lowers
 /// automatic start to manual and remembers the previous start type in
-/// `saved`; starting restores it (and forgets it).
+/// `saved`; starting restores it (and forgets it), or with nothing
+/// remembered puts a manual Acer service back to automatic (see
+/// [`plan_start`]).
 pub fn set_services_with(run: bool, saved: &mut SavedStartTypes) {
     #[cfg(windows)]
     {
@@ -386,7 +398,7 @@ pub fn set_services_with(run: bool, saved: &mut SavedStartTypes) {
                 }
             };
             if run {
-                let (set, start) = plan_start(current, saved.get(name).copied());
+                let (set, start) = plan_start(name, current, saved.get(name).copied());
                 if let Some(t) = set {
                     if let Err(e) = svc::set_start_type(&s, t) {
                         tracing::warn!("cannot restore start type of {name}: {e}");
@@ -456,11 +468,28 @@ mod tests {
 
     #[test]
     fn start_restores_previous_type() {
-        assert_eq!(plan_start(DEMAND, Some(AUTO)), (Some(AUTO), true));
-        assert_eq!(plan_start(DEMAND, Some(DEMAND)), (None, true));
-        assert_eq!(plan_start(DEMAND, None), (None, true));
-        assert_eq!(plan_start(AUTO, None), (None, true));
-        assert_eq!(plan_start(DISABLED, None), (None, false));
-        assert_eq!(plan_start(DISABLED, Some(DISABLED)), (None, false));
+        assert_eq!(plan_start("PSSvc", DEMAND, Some(AUTO)), (Some(AUTO), true));
+        assert_eq!(plan_start("PSSvc", AUTO, None), (None, true));
+        assert_eq!(plan_start("PSSvc", DISABLED, None), (None, false));
+        assert_eq!(plan_start("PSSvc", DISABLED, Some(DISABLED)), (None, false));
+        // A remembered type always wins, also a remembered manual one.
+        assert_eq!(plan_start("PSSvc", DEMAND, Some(DEMAND)), (None, true));
+        assert_eq!(plan_start("PSSvc", AUTO, Some(DEMAND)), (Some(DEMAND), true));
+        // Remembered as disabled: put back, not started.
+        assert_eq!(plan_start("PSSvc", DEMAND, Some(DISABLED)), (Some(DISABLED), false));
+    }
+
+    #[test]
+    fn start_without_memory_returns_acer_services_to_auto() {
+        // Stopped by 0.2.2, which set manual without remembering.
+        for name in ACER_SERVICES {
+            assert_eq!(plan_start(name, DEMAND, None), (Some(AUTO), true), "{name}");
+        }
+        // Not a known Acer service: left as it is.
+        assert_eq!(plan_start("Spooler", DEMAND, None), (None, true));
+        // Disabled with nothing remembered stays disabled.
+        assert_eq!(plan_start("AcerQAAgent", DISABLED, None), (None, false));
+        // Service names are case-insensitive.
+        assert_eq!(plan_start("pssvc", DEMAND, None), (Some(AUTO), true));
     }
 }

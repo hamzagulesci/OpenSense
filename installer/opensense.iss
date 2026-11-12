@@ -79,8 +79,10 @@ Filename: "{app}\opensense.exe"; Parameters: "--tray"; Flags: nowait; Check: Rel
 Filename: "{app}\opensense.exe"; Parameters: "--quit"; Flags: runhidden waituntilterminated; RunOnceId: "QuitApp"
 Filename: "{app}\opensense.exe"; Parameters: "--autostart-off"; Flags: runhidden waituntilterminated; RunOnceId: "Autostart"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM opensense.exe"; Flags: runhidden waituntilterminated; RunOnceId: "StopApp"
-; With nothing left running: undo the power plan, lid, NVIDIA clock and
-; Acer service changes (before the files are removed).
+; With nothing left running: undo the power plan / power mode, lid, NVIDIA
+; clock and Acer service changes, and set the firmware to fans Auto,
+; operation mode Default and charge limit off (before the files are
+; removed). Firmware failures are logged; it waits at most 20 s for them.
 Filename: "{app}\opensense.exe"; Parameters: "--restore-system"; Flags: runhidden waituntilterminated; RunOnceId: "RestoreSystem"
 
 [UninstallDelete]

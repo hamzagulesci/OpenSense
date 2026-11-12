@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Pos2, Rect, Sense, Vec2};
 use opensense_proto::lighting::Rgb;
-use opensense_sys::config::{AppConfig, LightingKind, TempUnit};
+use opensense_sys::config::{AppConfig, LightingConfig, LightingKind, TempUnit};
 use opensense_sys::tweaks::{self, setting};
 
 use crate::automation::HOTKEYS;
@@ -42,9 +42,9 @@ pub struct ExtraApp {
     timeouts: [Option<u32>; 3],
     timeouts_read: Instant,
     message: String,
-    /// A zone colour was changed in the picker but not yet sent to the
+    /// Zones whose colour was changed in the picker but not yet sent to the
     /// keyboard and saved (done once the drag ends or the popup closes).
-    lighting_pending: bool,
+    zones_pending: [bool; 4],
     /// A backlight timeout field was changed but not yet saved (done once
     /// the drag ends or the field loses focus).
     timeout_pending: bool,
@@ -73,7 +73,7 @@ impl ExtraApp {
             timeouts: read_timeouts(),
             timeouts_read: Instant::now(),
             message: String::new(),
-            lighting_pending: false,
+            zones_pending: [false; 4],
             timeout_pending: false,
         };
         app.refresh_services();
@@ -97,13 +97,13 @@ impl ExtraApp {
     /// window's copy becomes the file's current settings, except for edits
     /// still waiting for their drag to end.
     fn edit(&mut self, edit: impl FnMut(&mut AppConfig)) {
-        let lighting = self.lighting_pending.then(|| self.cfg.lighting.clone());
+        let zones = self.pending_zones();
         let timeouts = self.timeout_pending.then_some((self.cfg.kb_timeout_ac, self.cfg.kb_timeout_battery));
         if let Err(e) = crate::tray::edit_config(&mut self.cfg, edit) {
             self.message = e.to_string();
         }
-        if let Some(l) = lighting {
-            self.cfg.lighting = l;
+        if !zones.is_empty() {
+            set_zones(&mut self.cfg.lighting, &zones);
         }
         if let Some((ac, battery)) = timeouts {
             (self.cfg.kb_timeout_ac, self.cfg.kb_timeout_battery) = (ac, battery);
@@ -113,12 +113,30 @@ impl ExtraApp {
         crate::tray::notify_config_changed();
     }
 
-    /// Sends the lighting edited in the window's copy and saves it.
-    fn apply_lighting(&mut self) {
-        self.lighting_pending = false;
-        let _ = self.worker.tx.send(crate::apply::lighting(&self.cfg.lighting));
-        let lighting = self.cfg.lighting.clone();
-        self.edit(|c| c.lighting.clone_from(&lighting));
+    fn lighting_pending(&self) -> bool {
+        self.zones_pending.contains(&true)
+    }
+
+    /// Zone colours waiting to be saved, with their zone index.
+    fn pending_zones(&self) -> Vec<(usize, String)> {
+        (0..4).filter(|&z| self.zones_pending[z]).map(|z| (z, self.cfg.lighting.zones[z].clone())).collect()
+    }
+
+    /// Saves only the lighting fields `f` sets, on top of what the file
+    /// holds (so a brightness shortcut pressed meanwhile is kept). With
+    /// `send` the result also goes to the keyboard.
+    fn save_lighting(&mut self, send: bool, f: impl Fn(&mut LightingConfig)) {
+        self.edit(|c| f(&mut c.lighting));
+        if send {
+            let _ = self.worker.tx.send(crate::apply::lighting(&self.cfg.lighting));
+        }
+    }
+
+    /// Sends and saves the zone colours changed in the picker.
+    fn apply_zones(&mut self) {
+        let zones = self.pending_zones();
+        self.zones_pending = [false; 4];
+        self.save_lighting(true, |l| set_zones(l, &zones));
     }
 
     fn save_timeouts(&mut self) {
@@ -130,8 +148,8 @@ impl ExtraApp {
     /// Applies and saves edits still waiting for their drag to end (used
     /// when the window closes mid-edit).
     fn flush_pending(&mut self) {
-        if self.lighting_pending {
-            self.apply_lighting();
+        if self.lighting_pending() {
+            self.apply_zones();
         }
         if self.timeout_pending {
             self.save_timeouts();
@@ -212,7 +230,7 @@ impl eframe::App for ExtraApp {
             self.flush_pending();
         }
         // Not while an edit is waiting to be saved: reloading would undo it.
-        let pending = self.lighting_pending || self.timeout_pending;
+        let pending = self.lighting_pending() || self.timeout_pending;
         if !pending && self.checked.elapsed() > Duration::from_millis(200) {
             self.checked = Instant::now();
             let m = crate::fans_window::config_mtime();
@@ -307,8 +325,8 @@ impl ExtraApp {
             p.fore,
         );
         if let Some(v) = out.commit {
-            self.cfg.lighting.brightness_level = v as u8;
-            self.apply_lighting();
+            let level = v as u8;
+            self.save_lighting(true, |l| l.brightness_level = level);
         }
         if !rgb {
             ui.add_space(8.0);
@@ -335,12 +353,8 @@ impl ExtraApp {
         );
         if let Some(v) = out.commit {
             let speed = v as u8;
-            self.cfg.lighting.speed = speed;
-            if dynamic {
-                self.apply_lighting();
-            } else {
-                self.edit(|c| c.lighting.speed = speed);
-            }
+            // Only an effect shows the speed; static lighting just keeps it.
+            self.save_lighting(dynamic, |l| l.speed = speed);
         }
         let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW), Sense::hover());
         label_left(ui, row, self.t("Direction"), dynamic);
@@ -363,18 +377,12 @@ impl ExtraApp {
                 selected: self.cfg.lighting.direction == dir,
             };
             if ui::tile(ui, cell, dir, self.t(text), &style).clicked() && self.cfg.lighting.direction != dir {
-                self.cfg.lighting.direction = dir.into();
-                if dynamic {
-                    self.apply_lighting();
-                } else {
-                    self.edit(|c| c.lighting.direction = dir.into());
-                }
+                self.save_lighting(dynamic, |l| l.direction = dir.into());
             }
         }
         // Zone colours (static lighting).
         let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW + 2.0), Sense::hover());
         label_left(ui, row, self.t("Zone colours"), true);
-        let mut changed = false;
         for z in 0..4 {
             let x = row.right() - 10.0 - (4 - z) as f32 * 48.0 + 4.0;
             let r = Rect::from_min_size(Pos2::new(x, row.top() + 3.0), Vec2::new(44.0, row.height() - 6.0));
@@ -388,19 +396,16 @@ impl ExtraApp {
                 {
                     self.cfg.lighting.zones[z] = Rgb::new(arr[0], arr[1], arr[2]).to_hex();
                     self.cfg.lighting.zone_enabled[z] = true;
-                    changed = true;
+                    self.cfg.lighting.kind = LightingKind::Static;
+                    self.zones_pending[z] = true;
                 }
             });
         }
         // The swatch follows the picker live; the keyboard and the settings
         // file are only written once the mouse is released (drag ended or
         // popup closed), not on every drag frame.
-        if changed {
-            self.cfg.lighting.kind = LightingKind::Static;
-            self.lighting_pending = true;
-        }
-        if self.lighting_pending && !ui.input(|i| i.pointer.any_down()) {
-            self.apply_lighting();
+        if self.lighting_pending() && !ui.input(|i| i.pointer.any_down()) {
+            self.apply_zones();
         }
         // Backlight timeouts.
         let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW), Sense::hover());
@@ -667,4 +672,34 @@ fn combo_row(ui: &mut egui::Ui, id: &str, label: &str, current: usize, items: &[
 fn read_timeouts() -> [Option<u32>; 3] {
     [setting::DISPLAY_OFF_AFTER, setting::SLEEP_AFTER, setting::HIBERNATE_AFTER]
         .map(|s| tweaks::read(s).ok().map(|(_, dc)| dc / 60))
+}
+
+/// Lighting fields a zone colour edit sets: those zones' colours (switched
+/// on) and static lighting.
+fn set_zones(l: &mut LightingConfig, zones: &[(usize, String)]) {
+    for (z, hex) in zones {
+        l.zones[*z].clone_from(hex);
+        l.zone_enabled[*z] = true;
+    }
+    l.kind = LightingKind::Static;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zone_edit_keeps_other_zones_and_brightness() {
+        // Saved meanwhile by another process: brightness and zone 3.
+        let mut l = LightingConfig { brightness_level: 2, kind: LightingKind::Dynamic, ..Default::default() };
+        l.zones[3] = "#0000FF".into();
+        l.zone_enabled[1] = false;
+        set_zones(&mut l, &[(1, "#00FF00".into())]);
+        assert_eq!(l.zones[1], "#00FF00");
+        assert!(l.zone_enabled[1]);
+        assert_eq!(l.zones[3], "#0000FF");
+        assert_eq!(l.zones[0], "#FF0000");
+        assert_eq!(l.brightness_level, 2);
+        assert_eq!(l.kind, LightingKind::Static);
+    }
 }

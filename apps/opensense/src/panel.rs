@@ -13,7 +13,7 @@ use opensense_hw::TransportKind;
 use opensense_proto::lighting::{Effect, Rgb};
 use opensense_proto::mode::{GpuMode, OperationMode};
 use opensense_proto::sensor::celsius_to_fahrenheit;
-use opensense_sys::config::{AppConfig, LightingKind, TempUnit};
+use opensense_sys::config::{AppConfig, LightingConfig, LightingKind, TempUnit};
 use opensense_sys::oem::OemInfo;
 
 use crate::apply::WriteState;
@@ -264,9 +264,9 @@ fn battery_report() {
 /// Inline colour picker under the keyboard row.
 struct Picker {
     color: Color32,
-    /// Lighting when the picker opened, restored by Cancel if a colour was
-    /// applied meanwhile (all zones, not just the first one's colour).
-    original: opensense_sys::config::LightingConfig,
+    /// Lighting when the picker opened; Cancel puts its colours back if a
+    /// colour was applied meanwhile (all zones, not just the first one's).
+    original: LightingConfig,
     applied: bool,
 }
 
@@ -900,14 +900,7 @@ impl QuickPanel {
                 toggle_extra(self.mock);
             }
             if picked != current {
-                let l = &mut self.cfg.lighting;
-                if picked == Effect::Static {
-                    l.kind = LightingKind::Static;
-                } else {
-                    l.kind = LightingKind::Dynamic;
-                    l.effect = picked.label().to_ascii_lowercase();
-                }
-                self.apply_lighting();
+                self.apply_lighting(|l| set_effect(l, picked));
             }
             if self.picker.is_some() {
                 self.color_picker(ui);
@@ -916,26 +909,22 @@ impl QuickPanel {
         });
     }
 
-    /// Sends the lighting edited in the panel's copy and saves it.
-    fn apply_lighting(&mut self) {
-        if self.cfg.lighting.brightness_level <= 1 {
-            self.cfg.lighting.brightness_level = 5;
-        }
+    /// Saves only the lighting fields `f` sets (on top of what the file
+    /// holds, so a brightness shortcut pressed meanwhile is kept), turns
+    /// the backlight on if it was off, and sends the result.
+    fn apply_lighting(&mut self, f: impl Fn(&mut LightingConfig)) {
+        self.edit(|c| {
+            f(&mut c.lighting);
+            if c.lighting.brightness_level <= 1 {
+                c.lighting.brightness_level = 5;
+            }
+        });
         self.send(crate::apply::lighting(&self.cfg.lighting));
-        let lighting = self.cfg.lighting.clone();
-        self.edit(|c| c.lighting.clone_from(&lighting));
     }
 
     fn set_keyboard_color(&mut self, c: Color32) {
         let hex = Rgb::new(c.r(), c.g(), c.b()).to_hex();
-        let l = &mut self.cfg.lighting;
-        if l.kind == LightingKind::Static {
-            l.zones = [hex.clone(), hex.clone(), hex.clone(), hex];
-            l.zone_enabled = [true; 4];
-        } else {
-            l.effect_color = hex;
-        }
-        self.apply_lighting();
+        self.apply_lighting(|l| set_color(l, &hex));
     }
 
     /// Preset swatches, a hue/saturation picker and OK / Cancel.
@@ -994,8 +983,7 @@ impl QuickPanel {
                 }
                 if ui::row_button(ui, cells[2], "picker-cancel", self.t("Cancel"), None, true).clicked() {
                     if picker.applied {
-                        self.cfg.lighting = picker.original.clone();
-                        self.apply_lighting();
+                        self.apply_lighting(|l| restore_colors(l, &picker.original));
                     }
                     close = true;
                 }
@@ -1177,9 +1165,69 @@ fn hex_color(hex: &str) -> Color32 {
     Color32::from_rgb(c.r, c.g, c.b)
 }
 
+/// Lighting fields an effect choice sets: the kind and the effect name.
+fn set_effect(l: &mut LightingConfig, e: Effect) {
+    if e == Effect::Static {
+        l.kind = LightingKind::Static;
+    } else {
+        l.kind = LightingKind::Dynamic;
+        l.effect = e.label().to_ascii_lowercase();
+    }
+}
+
+/// Lighting fields the colour button sets: all zones for static lighting,
+/// otherwise the effect colour.
+fn set_color(l: &mut LightingConfig, hex: &str) {
+    if l.kind == LightingKind::Static {
+        l.zones = std::array::from_fn(|_| hex.to_owned());
+        l.zone_enabled = [true; 4];
+    } else {
+        l.effect_color = hex.to_owned();
+    }
+}
+
+/// Cancel in the colour picker: the colour fields as they were.
+fn restore_colors(l: &mut LightingConfig, original: &LightingConfig) {
+    l.zones.clone_from(&original.zones);
+    l.zone_enabled = original.zone_enabled;
+    l.effect_color.clone_from(&original.effect_color);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lighting as another process saved it meanwhile (brightness shortcut).
+    fn saved_elsewhere() -> LightingConfig {
+        LightingConfig { brightness_level: 3, speed: 7, ..Default::default() }
+    }
+
+    #[test]
+    fn colour_and_effect_edits_keep_other_lighting_fields() {
+        let mut l = saved_elsewhere();
+        set_color(&mut l, "#00FF00");
+        assert_eq!(l.zones, std::array::from_fn(|_| "#00FF00".to_owned()));
+        assert_eq!((l.brightness_level, l.speed), (3, 7));
+
+        set_effect(&mut l, Effect::Breathing);
+        assert_eq!(l.kind, LightingKind::Dynamic);
+        assert_eq!(l.effect, "breathing");
+        set_color(&mut l, "#0000FF");
+        assert_eq!(l.effect_color, "#0000FF");
+        // Zone colours stay when an effect colour is picked.
+        assert_eq!(l.zones[0], "#00FF00");
+        assert_eq!((l.brightness_level, l.speed), (3, 7));
+    }
+
+    #[test]
+    fn cancel_restores_only_colours() {
+        let original = LightingConfig::default();
+        let mut l = saved_elsewhere();
+        set_color(&mut l, "#123456");
+        restore_colors(&mut l, &original);
+        assert_eq!(l.zones, original.zones);
+        assert_eq!(l.brightness_level, 3);
+    }
 
     #[test]
     fn model_title_format() {

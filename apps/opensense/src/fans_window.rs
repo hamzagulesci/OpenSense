@@ -54,6 +54,9 @@ pub struct FansWindow {
     /// Y axis in percent instead of RPM.
     percent_axis: bool,
     renaming: bool,
+    /// The name typed while renaming; saved once, when the rename ends
+    /// (Enter, "Done", focus lost, mode switched or window closing).
+    rename: Option<String>,
     confirm_remove: bool,
     result: String,
     calibration: Option<Calibration>,
@@ -89,6 +92,7 @@ impl FansWindow {
             drag: None,
             percent_axis: false,
             renaming: false,
+            rename: None,
             confirm_remove: false,
             result: String::new(),
             calibration: None,
@@ -110,12 +114,29 @@ impl FansWindow {
         ];
         self.key = key;
         self.renaming = false;
+        self.rename = None;
         self.confirm_remove = false;
+    }
+
+    /// Ends a rename and saves the typed name (once). Returns true when the
+    /// settings changed.
+    pub fn finish_rename(&mut self, cfg: &mut AppConfig) -> bool {
+        self.renaming = false;
+        let Some(name) = self.rename.take() else { return false };
+        if !renamed(cfg, &self.key, &name) {
+            return false;
+        }
+        let key = self.key.clone();
+        edit(cfg, |c| modes::edit_profile(c, &key, |p| p.name.clone_from(&name)));
+        true
     }
 
     /// Draws the window contents.
     pub fn show(&mut self, ctx: &egui::Context, cfg: &mut AppConfig, lang: Lang, worker: &WorkerHandle) -> bool {
+        let mut changed = false;
         if self.key != modes::current_key(cfg) {
+            // The mode was switched elsewhere: the name belongs to the old one.
+            changed |= self.finish_rename(cfg);
             self.reload(cfg);
         }
         if self.windows_read.is_none_or(|t| t.elapsed() > Duration::from_secs(5)) {
@@ -124,7 +145,6 @@ impl FansWindow {
             self.boost = opensense_sys::power::cpu_boost();
             self.windows_read = Some(Instant::now());
         }
-        let mut changed = false;
         egui::CentralPanel::default().frame(egui::Frame::none().fill(pal().form).inner_margin(5.0)).show(ctx, |ui| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             ui.horizontal_top(|ui| {
@@ -323,20 +343,17 @@ impl FansWindow {
         let mut picked = self.key.clone();
         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(combo_rect), |ui| {
             if self.renaming && custom {
-                let mut name = modes::profile(cfg, &self.key).name;
-                let r = ui.add_sized(
-                    combo_rect.size(),
-                    egui::TextEdit::singleline(&mut name).vertical_align(egui::Align::Center),
-                );
+                // Typing only edits the window's buffer; the settings file
+                // is written once, when the rename ends.
+                let name = self.rename.get_or_insert_with(|| modes::profile(cfg, &self.key).name);
+                let r = ui
+                    .add_sized(combo_rect.size(), egui::TextEdit::singleline(name).vertical_align(egui::Align::Center));
                 if !r.has_focus() && !r.lost_focus() {
                     r.request_focus();
                 }
-                if r.changed() {
-                    edit(cfg, |c| modes::edit_profile(c, &self.key, |p| p.name.clone_from(&name)));
-                    changed = true;
-                }
+                // Enter, "Done" and clicking elsewhere all take the focus.
                 if r.lost_focus() {
-                    self.renaming = false;
+                    changed |= self.finish_rename(cfg);
                 }
             } else {
                 egui::ComboBox::from_id_salt("fan-mode")
@@ -355,6 +372,7 @@ impl FansWindow {
         if modes::can_add(cfg)
             && ui::row_button(ui, add_rect, "add-mode", "+", None, true).on_hover_text(t("Add mode")).clicked()
         {
+            changed |= self.finish_rename(cfg);
             // Added and selected in one save, under a key still free in the file.
             edit(cfg, |c| {
                 added = modes::add_custom(c, lang);
@@ -389,10 +407,14 @@ impl FansWindow {
             );
             let label = if self.renaming { t("Done") } else { t("Rename") };
             if ui::row_button(ui, rename, "rename-mode", label, None, true).clicked() {
-                self.renaming = !was_renaming;
+                if was_renaming {
+                    changed |= self.finish_rename(cfg);
+                } else {
+                    self.renaming = true;
+                }
             }
             if ui::row_button(ui, del, "remove-mode", t("Delete"), None, true).clicked() {
-                self.renaming = false;
+                changed |= self.finish_rename(cfg);
                 self.confirm_remove = true;
             }
             clamp_row = Some(Rect::from_min_max(row.min, Pos2::new(rename.left() - 4.0, row.max.y)));
@@ -729,6 +751,12 @@ impl FansWindow {
 
 // ---- small helpers ------------------------------------------------------------------
 
+/// A typed mode name differs from the one stored for `key` (a mode deleted
+/// meanwhile counts as unchanged: there is nothing left to rename).
+fn renamed(cfg: &AppConfig, key: &str, name: &str) -> bool {
+    cfg.profiles.get(key).is_some_and(|p| p.name != name)
+}
+
 /// Saves the fields `f` sets and refreshes `cfg` from the file (see
 /// [`crate::tray::edit_config`]).
 fn edit(cfg: &mut AppConfig, f: impl FnMut(&mut AppConfig)) {
@@ -827,6 +855,16 @@ impl FansApp {
     }
 }
 
+impl FansApp {
+    /// Saves a rename in progress (see [`FansWindow::finish_rename`]).
+    fn finish_rename(&mut self) {
+        if self.window.finish_rename(&mut self.cfg) {
+            self.modified = config_mtime();
+            crate::tray::notify_config_changed();
+        }
+    }
+}
+
 impl eframe::App for FansApp {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         raw_input.max_texture_side = Some(raw_input.max_texture_side.unwrap_or(2048).min(2048));
@@ -850,14 +888,20 @@ impl eframe::App for FansApp {
         // A calibration has the fans at Max: the window stays until it has
         // finished and handed them back.
         let busy = self.window.calibrating();
+        // A name still being typed is saved before the window goes.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.finish_rename();
+        }
         crate::panel::hold_close(ctx, busy, &mut self.close_pending);
         // Like a flyout: switching to another app closes the window.
         if busy {
             self.away.reset();
         } else if self.away.gone(ctx) && !self.cfg.topmost {
+            self.finish_rename();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !busy {
+            self.finish_rename();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         // Follow changes made by the main window or the tray menu. Not while
@@ -883,5 +927,21 @@ impl eframe::App for FansApp {
             crate::tray::notify_config_changed();
         }
         ctx.request_repaint_after(Duration::from_millis(200));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opensense_sys::config::ModeProfile;
+
+    #[test]
+    fn rename_saves_only_a_real_change() {
+        let mut cfg = AppConfig::default();
+        cfg.profiles.insert("custom1".into(), ModeProfile { name: "Gaming".into(), ..Default::default() });
+        assert!(!renamed(&cfg, "custom1", "Gaming"));
+        assert!(renamed(&cfg, "custom1", "Gaming 2"));
+        // Deleted in another window meanwhile: nothing to save.
+        assert!(!renamed(&cfg, "custom2", "Work"));
     }
 }

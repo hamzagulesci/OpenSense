@@ -359,37 +359,29 @@ fn save_choice(cfg: &mut AppConfig, edit: impl FnMut(&mut AppConfig)) {
     }
 }
 
-/// Saves what the automation (shortcuts, mode per power source, clamshell)
-/// changed in the agent's copy since `before`: only the fields
-/// `automation.rs` sets, and only those that differ.
-fn save_automation(before: &AppConfig, cfg: &mut AppConfig) {
-    let now = cfg.clone();
-    save_choice(cfg, |c| {
-        if now.current_mode != before.current_mode {
-            c.current_mode.clone_from(&now.current_mode);
-        }
-        if now.operation_mode != before.operation_mode {
-            c.operation_mode.clone_from(&now.operation_mode);
-        }
-        if now.fan.mode != before.fan.mode {
-            c.fan.mode = now.fan.mode;
-        }
-        if now.overlay != before.overlay {
-            c.overlay = now.overlay;
-        }
-        if now.lighting.brightness_level != before.lighting.brightness_level {
-            c.lighting.brightness_level = now.lighting.brightness_level;
-        }
-        if now.mode_ac != before.mode_ac {
-            c.mode_ac.clone_from(&now.mode_ac);
-        }
-        if now.mode_dc != before.mode_dc {
-            c.mode_dc.clone_from(&now.mode_dc);
-        }
-        if now.clamshell_default_lid != before.clamshell_default_lid {
-            c.clamshell_default_lid = now.clamshell_default_lid;
-        }
-    });
+/// Runs automation code against the agent's settings and saves the changes
+/// it made, as it made them (see [`crate::automation::Tracked`]). Returns
+/// true when something changed. When the automation changed the lighting
+/// (and sent it) but the file held other lighting changes from a window,
+/// the merged lighting is sent again so the keyboard shows both.
+fn run_automation(
+    cfg: &mut AppConfig,
+    worker: &worker::WorkerHandle,
+    run: impl FnOnce(&mut crate::automation::Tracked),
+) -> bool {
+    let before = cfg.lighting.clone();
+    let mut tracked = crate::automation::Tracked::new(cfg);
+    run(&mut tracked);
+    let edits = tracked.into_edits();
+    if edits.is_empty() {
+        return false;
+    }
+    let sent = cfg.lighting.clone();
+    save_choice(cfg, |c| edits.apply(c));
+    if sent != before && cfg.lighting != sent {
+        let _ = worker.tx.send(crate::apply::lighting(&cfg.lighting));
+    }
+    true
 }
 
 /// What a tray-menu entry does.
@@ -731,20 +723,14 @@ pub fn run(kind: TransportKind) {
             }
         }
         for h in hotkeys {
-            let before = cfg.clone();
-            let changed = auto.hotkey(h, &mut cfg, &worker, lang, mock);
-            if changed {
+            if run_automation(&mut cfg, &worker, |c| auto.hotkey(h, c, &worker, lang, mock)) {
                 last_switch = std::time::Instant::now();
                 fan_loop.reset();
-                save_automation(&before, &mut cfg);
             }
             sync_overlay(&mut overlay, &cfg);
         }
         if tick {
-            let before = cfg.clone();
-            if auto.tick(&mut cfg, &worker, lang) {
-                save_automation(&before, &mut cfg);
-            }
+            run_automation(&mut cfg, &worker, |c| auto.tick(c, &worker, lang));
             if let Some(o) = overlay.as_mut() {
                 if o.tick(&mut cfg, &crate::overlay::metrics(&worker)) {
                     let (mode, scale, pos) = (cfg.overlay_mode, cfg.overlay_scale, cfg.overlay_pos);

@@ -300,19 +300,36 @@ mod modes {
         })
     }
 
+    /// Remembers the active plan and power mode for
+    /// `opensense --restore-system` before the first change.
+    fn remember(current: Option<GUID>) {
+        if let Some(plan) = current {
+            crate::originals::remember_power_mode(plan.to_u128(), power_mode());
+        }
+    }
+
     pub fn set_power_mode(m: PowerMode) -> Result<(), SysError> {
         let current = active();
         if let PowerMode::Plan(g) = m {
             let g = GUID::from_u128(g);
             if current != Some(g) {
+                remember(current);
                 check(unsafe { PowerSetActiveScheme(None, Some(&g)) }.0, "PowerSetActiveScheme")?;
             }
             return Ok(());
         }
         // Power modes need a balanced plan; leave High / Ultimate Performance.
         if !current.is_some_and(|c| has_power_modes(&c)) {
+            remember(current);
             check(unsafe { PowerSetActiveScheme(None, Some(&PLAN_BALANCED)) }.0, "PowerSetActiveScheme")?;
+            return set_overlay(m, || {});
         }
+        set_overlay(m, || remember(current))
+    }
+
+    /// Sets the power mode (overlay) of the active plan, unless Energy saver
+    /// owns it or it is set already. `before` runs just before the change.
+    fn set_overlay(m: PowerMode, before: impl FnOnce()) -> Result<(), SysError> {
         if energy_saver() {
             return Ok(());
         }
@@ -325,7 +342,22 @@ mod modes {
         if unsafe { PowerGetEffectiveOverlayScheme(&mut g) } == 0 && g == target {
             return Ok(());
         }
+        before();
         check(unsafe { PowerSetActiveOverlayScheme(target) }, "PowerSetActiveOverlayScheme")
+    }
+
+    /// Puts back a power plan and its power mode (`overlay`, ignored for a
+    /// plan without power modes) remembered by [`set_power_mode`]. Nothing
+    /// new is remembered.
+    pub fn restore_power_mode(plan: u128, overlay: Option<PowerMode>) -> Result<(), SysError> {
+        let g = GUID::from_u128(plan);
+        if active() != Some(g) {
+            check(unsafe { PowerSetActiveScheme(None, Some(&g)) }.0, "PowerSetActiveScheme")?;
+        }
+        match overlay {
+            Some(m) if !matches!(m, PowerMode::Plan(_)) && has_power_modes(&g) => set_overlay(m, || {}),
+            _ => Ok(()),
+        }
     }
 
     pub fn cpu_boost() -> Option<u8> {
@@ -371,7 +403,9 @@ mod modes {
 }
 
 #[cfg(windows)]
-pub use modes::{cpu_boost, energy_saver, plans_without_modes, power_mode, set_cpu_boost, set_power_mode};
+pub use modes::{
+    cpu_boost, energy_saver, plans_without_modes, power_mode, restore_power_mode, set_cpu_boost, set_power_mode,
+};
 
 #[cfg(not(windows))]
 pub fn plans_without_modes() -> Vec<(PowerMode, String)> {
@@ -383,6 +417,10 @@ pub fn power_mode() -> Option<PowerMode> {
 }
 #[cfg(not(windows))]
 pub fn set_power_mode(_m: PowerMode) -> Result<(), SysError> {
+    Err(SysError::Unsupported)
+}
+#[cfg(not(windows))]
+pub fn restore_power_mode(_plan: u128, _overlay: Option<PowerMode>) -> Result<(), SysError> {
     Err(SysError::Unsupported)
 }
 #[cfg(not(windows))]

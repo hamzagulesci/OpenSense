@@ -4,12 +4,25 @@
 //! the plan is used. A setting is only touched while it still holds the
 //! value OpenSense sets, so a later change made by the user is kept.
 //!
-//! Fans, lighting, the operation mode and the charge limit live in the
-//! firmware and are not changed here.
+//! The power plan and power mode go back to the ones remembered before
+//! OpenSense first changed them (left alone when none is remembered).
+//!
+//! The firmware is handed back in a neutral state: fans on Auto, the
+//! operation mode on Default and the 80 % charge limit off. Keyboard
+//! lighting is left as it is. Firmware failures are only logged, and the
+//! firmware gets at most [`FIRMWARE_WAIT`], so a hung call cannot block the
+//! uninstaller.
 
+use std::time::{Duration, Instant};
+
+use opensense_hw::{NitroDevice, TransportKind};
+use opensense_proto::mode::OperationMode;
 use opensense_sys::config::AppConfig;
 use opensense_sys::originals::{self, Originals};
 use opensense_sys::tweaks::{self, setting};
+
+/// Longest wait for the firmware part before the process exits anyway.
+const FIRMWARE_WAIT: Duration = Duration::from_secs(20);
 
 /// Plugged-in PCIe link state to write back, if OpenSense still holds it
 /// off (0). `default` is the plan's Windows default.
@@ -29,15 +42,63 @@ fn lid_target(current_ac: u32, clamshell: bool, saved: Option<u32>, default: u32
     (current_ac == 0 && (clamshell || saved.is_some())).then(|| saved.filter(|&v| v != 0).unwrap_or(default.max(1)))
 }
 
-fn log(what: &str, r: Result<(), opensense_sys::SysError>) {
+/// Whether the operation mode must be set to Default: only when the
+/// firmware reports a mode (the model has operation modes) and it is
+/// another one.
+fn mode_needs_reset(current: Option<OperationMode>) -> bool {
+    current.is_some_and(|m| m != OperationMode::Default)
+}
+
+/// Whether the 80 % charge limit must be turned off.
+fn charge_limit_needs_reset(health: Option<opensense_proto::battery::BatteryHealth>) -> bool {
+    health.is_some_and(|h| h.limit_supported && h.limit_active)
+}
+
+fn log(what: &str, r: Result<(), impl std::fmt::Display>) {
     match r {
         Ok(()) => tracing::info!("restore-system: {what} restored"),
         Err(e) => tracing::warn!("restore-system: cannot restore {what}: {e}"),
     }
 }
 
+/// Operation mode Default, fans on Auto and the charge limit off, over a
+/// connection of its own (the tray agent has quit).
+fn restore_firmware() {
+    let oem = opensense_sys::oem::OemInfo::detect();
+    let transport = match opensense_hw::open_transport(TransportKind::Wmi) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("restore-system: no firmware connection, firmware left as it is: {e}");
+            return;
+        }
+    };
+    let dev = NitroDevice::new(transport, crate::worker::device_profile(&oem));
+    match dev.operation_mode() {
+        Ok(m) if mode_needs_reset(m) => log("operation mode", dev.set_operation_mode(OperationMode::Default)),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("restore-system: cannot read the operation mode: {e}"),
+    }
+    // After the mode: a mode change may set the fans itself.
+    log("fans (Auto)", dev.set_fans_auto());
+    match dev.battery_health() {
+        Ok(h) if charge_limit_needs_reset(Some(h)) => log("charge limit (off)", dev.set_charge_limit(false)),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("restore-system: cannot read the charge limit: {e}"),
+    }
+}
+
 pub fn run() {
-    tracing::info!("restore-system: undoing Windows settings changed by OpenSense");
+    tracing::info!("restore-system: undoing Windows and firmware settings changed by OpenSense");
+    let started = Instant::now();
+    // The firmware in parallel; waited for (with a limit) at the end.
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let firmware = std::thread::Builder::new().name("restore-firmware".into()).spawn(move || {
+        restore_firmware();
+        let _ = done_tx.send(());
+    });
+    if let Err(e) = &firmware {
+        tracing::warn!("restore-system: cannot start the firmware restore: {e}");
+    }
     let cfg = AppConfig::load();
     let orig = Originals::load();
     let plan = tweaks::active_plan().ok();
@@ -80,6 +141,12 @@ pub fn run() {
         }
     }
 
+    // Power plan and power mode, last: the settings above were changed in
+    // the plan that is active now.
+    if let Some((p, mode)) = originals::remembered_power(&orig) {
+        log("power plan", opensense_sys::power::restore_power_mode(p, mode));
+    }
+
     // NVIDIA clock lock (nvidia-smi -rgc), when a mode had a limit.
     if cfg.profiles.values().any(|p| p.gpu_clock_limit.is_some_and(|l| l < crate::nvidia::CLOCK_MAX)) {
         crate::nvidia::set_clock_limit(None, true);
@@ -88,6 +155,13 @@ pub fn run() {
     // Acer services stopped by OpenSense: start type back and started.
     if !cfg.service_start_types.is_empty() {
         tweaks::set_services(true);
+    }
+
+    if firmware.is_ok() {
+        let left = FIRMWARE_WAIT.saturating_sub(started.elapsed());
+        if done_rx.recv_timeout(left).is_err() {
+            tracing::warn!("restore-system: firmware did not answer in time; left as it is");
+        }
     }
     tracing::info!("restore-system: done");
 }
@@ -113,6 +187,25 @@ mod tests {
         assert_eq!(standby_target((0, 0), false, Some([2, 2]), (1, 2)), Some((2, 2)));
         assert_eq!(standby_target((0, 0), false, None, (1, 2)), None);
         assert_eq!(standby_target((1, 2), true, Some([1, 1]), (1, 2)), None);
+    }
+
+    #[test]
+    fn firmware_mode_reset_only_when_another_mode() {
+        assert!(mode_needs_reset(Some(OperationMode::Extreme)));
+        assert!(mode_needs_reset(Some(OperationMode::Quiet)));
+        assert!(!mode_needs_reset(Some(OperationMode::Default)));
+        // No operation modes on this model.
+        assert!(!mode_needs_reset(None));
+    }
+
+    #[test]
+    fn charge_limit_reset_only_while_on() {
+        use opensense_proto::battery::BatteryHealth;
+        let h = |limit_supported, limit_active| BatteryHealth { limit_supported, limit_active, ..Default::default() };
+        assert!(charge_limit_needs_reset(Some(h(true, true))));
+        assert!(!charge_limit_needs_reset(Some(h(true, false))));
+        assert!(!charge_limit_needs_reset(Some(h(false, true))));
+        assert!(!charge_limit_needs_reset(None));
     }
 
     #[test]

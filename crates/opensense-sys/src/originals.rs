@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::power::PowerMode;
 use crate::tweaks::{self, setting};
 use crate::SysError;
 
@@ -23,6 +24,52 @@ pub struct Originals {
     /// Processor boost mode (AC, DC) per power plan (GUID as 32 hex
     /// digits, see [`plan_key`]) before OpenSense first changed it there.
     pub cpu_boost: BTreeMap<String, [u32; 2]>,
+    /// Active power plan ([`plan_key`]) before OpenSense first changed the
+    /// plan or the power mode.
+    pub power_plan: Option<String>,
+    /// Power mode of that plan ([`PowerMode::key`] of an overlay), when the
+    /// plan has power modes.
+    pub power_mode: Option<String>,
+}
+
+/// The power plan and power mode to remember before OpenSense changes them:
+/// the current ones, unless a plan is remembered already. `mode` is the
+/// current [`crate::power::power_mode`]; only a power mode (overlay) is kept,
+/// a plan without power modes is the plan itself.
+fn power_to_remember(
+    saved_plan: Option<&str>,
+    plan: u128,
+    mode: Option<PowerMode>,
+) -> Option<(String, Option<String>)> {
+    if saved_plan.is_some() {
+        return None;
+    }
+    let overlay = mode.filter(|m| !matches!(m, PowerMode::Plan(_))).map(PowerMode::key);
+    Some((plan_key(plan), overlay))
+}
+
+/// The remembered power plan and power mode, if a plan is remembered.
+pub fn remembered_power(o: &Originals) -> Option<(u128, Option<PowerMode>)> {
+    let plan = parse_plan_key(o.power_plan.as_deref()?)?;
+    let mode = o.power_mode.as_deref().and_then(PowerMode::from_key).filter(|m| !matches!(m, PowerMode::Plan(_)));
+    Some((plan, mode))
+}
+
+/// Called by [`crate::power::set_power_mode`] before it changes the active
+/// plan or the power mode from `plan` / `mode`. Only the first value is kept.
+pub(crate) fn remember_power_mode(plan: u128, mode: Option<PowerMode>) {
+    if Originals::load().power_plan.is_some() {
+        return;
+    }
+    let r = Originals::update(|o| {
+        if let Some((p, m)) = power_to_remember(o.power_plan.as_deref(), plan, mode) {
+            o.power_plan = Some(p);
+            o.power_mode = m;
+        }
+    });
+    if let Err(e) = r {
+        tracing::warn!("cannot remember the power plan: {e}");
+    }
 }
 
 /// Key of a power plan in [`Originals::cpu_boost`].
@@ -176,6 +223,41 @@ mod tests {
         assert_eq!(standby_to_remember((1, 1), Some([1, 2])), None);
         // Half off is not OpenSense's own value.
         assert_eq!(standby_to_remember((0, 2), None), Some([0, 2]));
+    }
+
+    #[test]
+    fn power_remembers_first_plan_and_overlay_only() {
+        let balanced = 0x381b4222_f694_41f0_9685_ff5bb260df2e;
+        let key = plan_key(balanced);
+        assert_eq!(
+            power_to_remember(None, balanced, Some(PowerMode::BestEfficiency)),
+            Some((key.clone(), Some("efficiency".into())))
+        );
+        // A plan without power modes: only the plan.
+        let high = crate::power::PLAN_HIGH;
+        assert_eq!(power_to_remember(None, high, Some(PowerMode::Plan(high))), Some((plan_key(high), None)));
+        // Power mode unreadable: the plan alone.
+        assert_eq!(power_to_remember(None, balanced, None), Some((key.clone(), None)));
+        // Something remembered already: kept.
+        assert_eq!(power_to_remember(Some(&key), high, None), None);
+    }
+
+    #[test]
+    fn remembered_power_parses_back() {
+        let mut o = Originals::default();
+        assert_eq!(remembered_power(&o), None);
+        o.power_mode = Some("performance".into());
+        // A mode without a plan is not used.
+        assert_eq!(remembered_power(&o), None);
+        o.power_plan = Some(plan_key(5));
+        assert_eq!(remembered_power(&o), Some((5, Some(PowerMode::BestPerformance))));
+        o.power_mode = None;
+        assert_eq!(remembered_power(&o), Some((5, None)));
+        // A stored plan key in the mode field is ignored.
+        o.power_mode = Some(PowerMode::Plan(9).key());
+        assert_eq!(remembered_power(&o), Some((5, None)));
+        o.power_plan = Some("not hex".into());
+        assert_eq!(remembered_power(&o), None);
     }
 
     #[test]

@@ -173,7 +173,8 @@ pub fn commands(cfg: &AppConfig, key: &str) -> Vec<Command> {
 }
 
 /// Stores a mode as the current one: the settings a mode switch changes
-/// (`current_mode`, `operation_mode` and possibly `fan.mode`).
+/// (`current_mode`, `operation_mode` and possibly `fan.mode`). Callers run
+/// it inside a field-level save, then [`activate`] the mode.
 pub fn select(cfg: &mut AppConfig, key: &str) {
     let base = base_of(cfg, key);
     cfg.current_mode = Some(key.to_owned());
@@ -190,13 +191,6 @@ pub fn activate(cfg: &AppConfig, key: &str, worker: &WorkerHandle) {
     }
     let (p, base) = (profile(cfg, key), base_of(cfg, key));
     std::thread::spawn(move || apply_windows(&p, base));
-}
-
-/// Switches to a mode: [`select`] and [`activate`]. The caller saves the
-/// fields `select` changed.
-pub fn switch(cfg: &mut AppConfig, key: &str, worker: &WorkerHandle) {
-    select(cfg, key);
-    activate(cfg, key, worker);
 }
 
 /// Changes the settings of a mode. A user mode that is gone (deleted in
